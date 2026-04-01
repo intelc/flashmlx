@@ -58,34 +58,40 @@ def generate(
     y = _sample(logits, temperature)
     mx.async_eval(y)
 
-    # Generate tokens, building N-step graph before eval
-    BATCH_STEPS = eval_batch_size
-    generated = 0
-    while generated < max_tokens:
-        yield y.item()
-        generated += 1
-        if generated >= max_tokens:
-            break
-
-        # Build multi-step computation graph before eval
-        remaining = min(BATCH_STEPS, max_tokens - generated)
-        tokens = []
-        prev = y
-        for _ in range(remaining):
-            logits = model(prev.reshape(1, 1), cache=cache)
+    if eval_batch_size <= 1:
+        # Simple per-token loop — optimal for large models
+        for _ in range(max_tokens):
+            yield y.item()
+            logits = model(y.reshape(1, 1), cache=cache)
             logits = logits[:, -1, :]
-            prev = _sample(logits, temperature)
-            tokens.append(prev)
-
-        # Eval all tokens at once
-        mx.async_eval(*tokens)
-
-        # Yield all but last (last becomes y for next iteration)
-        for t in tokens[:-1]:
-            yield t.item()
+            y = _sample(logits, temperature)
+            mx.async_eval(y)
+    else:
+        # N-step graph batching — optimal for small models
+        BATCH_STEPS = eval_batch_size
+        generated = 0
+        while generated < max_tokens:
+            yield y.item()
             generated += 1
+            if generated >= max_tokens:
+                break
 
-        y = tokens[-1]
+            remaining = min(BATCH_STEPS, max_tokens - generated)
+            tokens = []
+            prev = y
+            for _ in range(remaining):
+                logits = model(prev.reshape(1, 1), cache=cache)
+                logits = logits[:, -1, :]
+                prev = _sample(logits, temperature)
+                tokens.append(prev)
+
+            mx.async_eval(*tokens)
+
+            for t in tokens[:-1]:
+                yield t.item()
+                generated += 1
+
+            y = tokens[-1]
 
 
 def _sample(logits: mx.array, temperature: float) -> mx.array:
