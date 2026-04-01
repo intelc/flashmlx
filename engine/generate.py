@@ -57,7 +57,7 @@ def generate(
     mx.async_eval(y)
 
     # Generate tokens, building N-step graph before eval
-    BATCH_STEPS = 4
+    BATCH_STEPS = 8
     generated = 0
     while generated < max_tokens:
         yield y.item()
