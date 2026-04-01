@@ -442,13 +442,14 @@ mx::array NemotronHModel::mamba_block(
         // Update state: drop oldest, keep last conv_kernel-1 for next step
         conv_state = mx::slice(full_window, {0, 1, 0}, {B_dim, conv_kernel_, conv_dim_});
 
-        // Depthwise conv: element-wise multiply and sum over kernel dimension
-        // full_window: [B, conv_kernel, conv_dim]
-        // conv_w: [conv_dim, conv_kernel] -> transpose to [conv_kernel, conv_dim]
-        auto conv_w_t = mx::transpose(conv_w, {1, 0});  // [conv_kernel, conv_dim]
-        // Broadcast multiply: [B, conv_kernel, conv_dim] * [1, conv_kernel, conv_dim]
-        auto conv_w_exp = mx::expand_dims(conv_w_t, 0);  // [1, conv_kernel, conv_dim]
-        auto conv_out = mx::sum(mx::multiply(full_window, conv_w_exp), 1, /*keepdims=*/true);
+        // Depthwise conv1d using MLX's built-in (faster Metal kernel)
+        // full_window: [B, conv_kernel, conv_dim], conv_w: [conv_dim, conv_kernel]
+        // conv1d expects: input [B, L, C_in], weight [C_out, K_w, C_in/groups]
+        // For depthwise: groups=conv_dim, C_out=conv_dim, C_in/groups=1
+        // Weight shape needs to be [conv_dim, conv_kernel, 1]
+        auto conv_w_3d = mx::expand_dims(conv_w, -1);  // [conv_dim, conv_kernel, 1]
+        auto conv_out = mx::conv1d(full_window, conv_w_3d, /*stride=*/1, /*padding=*/0,
+                                   /*dilation=*/1, /*groups=*/conv_dim_);
         // conv_out: [B, 1, conv_dim]
 
         // Add conv bias
@@ -888,7 +889,7 @@ mx::array NemotronHModel::forward(
         auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
         auto normed = rms_norm(h, norm_w);
 
-        mx::array block_out(0.0f);
+        mx::array block_out = normed;  // placeholder, overwritten by each branch
         switch (block_types_[i]) {
             case BlockType::Mamba: {
                 int mamba_idx = mamba_layer_indices_[i];
@@ -947,7 +948,7 @@ mx::array NemotronHModel::forward(
         auto normed = rms_norm(h, norm_w);
 
 
-        mx::array block_out(0.0f);
+        mx::array block_out = normed;  // placeholder, overwritten by each branch
         switch (block_types_[i]) {
             case BlockType::Mamba: {
                 int mamba_idx = mamba_layer_indices_[i];
