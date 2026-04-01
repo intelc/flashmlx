@@ -433,8 +433,7 @@ mx::array NemotronHModel::mamba_block(
         // conv_state: [B, conv_kernel-1, conv_dim] stores the last k-1 conv inputs.
         // For the convolution we need the last k inputs = concat(state, new_input).
         auto conv_w = get_weight(prefix + ".conv1d.weight");
-        // conv_w shape: [conv_dim, conv_kernel, 1] -> squeeze to [conv_dim, conv_kernel]
-        conv_w = mx::squeeze(conv_w, -1);  // [conv_dim, conv_kernel]
+        // conv_w shape: [conv_dim, conv_kernel, 1] — ready for depthwise conv1d
 
         // Build full convolution window: [B, conv_kernel, conv_dim]
         auto full_window = mx::concatenate({conv_state, conv_input}, 1);
@@ -442,13 +441,8 @@ mx::array NemotronHModel::mamba_block(
         // Update state: drop oldest, keep last conv_kernel-1 for next step
         conv_state = mx::slice(full_window, {0, 1, 0}, {B_dim, conv_kernel_, conv_dim_});
 
-        // Depthwise conv1d using MLX's built-in (faster Metal kernel)
-        // full_window: [B, conv_kernel, conv_dim], conv_w: [conv_dim, conv_kernel]
-        // conv1d expects: input [B, L, C_in], weight [C_out, K_w, C_in/groups]
-        // For depthwise: groups=conv_dim, C_out=conv_dim, C_in/groups=1
-        // Weight shape needs to be [conv_dim, conv_kernel, 1]
-        auto conv_w_3d = mx::expand_dims(conv_w, -1);  // [conv_dim, conv_kernel, 1]
-        auto conv_out = mx::conv1d(full_window, conv_w_3d, /*stride=*/1, /*padding=*/0,
+        // Depthwise conv1d
+        auto conv_out = mx::conv1d(full_window, conv_w, /*stride=*/1, /*padding=*/0,
                                    /*dilation=*/1, /*groups=*/conv_dim_);
         // conv_out: [B, 1, conv_dim]
 
