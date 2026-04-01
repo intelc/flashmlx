@@ -38,6 +38,14 @@ struct ModelConfig {
     int moe_intermediate_size = 0;
     int shared_expert_intermediate_size = 0;
     bool norm_topk_prob = false;
+
+    // MoE for Nemotron-H (DeepSeek-V2 style routing)
+    int n_routed_experts = 0;       // 128 for 30B
+    int n_shared_experts = 0;       // 1
+    int moe_shared_expert_intermediate_size = 0;  // 3712
+    float routed_scaling_factor = 1.0f;  // 2.5
+    int n_group = 1;
+    int topk_group = 1;
 };
 
 // MoE stacked expert weights for a single layer
@@ -222,6 +230,7 @@ private:
                               mx::array& cache_k, mx::array& cache_v,
                               const mx::array& cache_offsets);
     mx::array mlp_block(const mx::array& x, int layer);
+    mx::array moe_block(const mx::array& x, int layer);
 
     mx::array get_weight(const std::string& name) const;
     bool has_weight(const std::string& name) const;

@@ -78,7 +78,7 @@ bool json_bool(const std::string& json, const std::string& key, bool def) {
 // Block type enum
 // ---------------------------------------------------------------------------
 
-enum class BlockType { Mamba, Attention, MLP };
+enum class BlockType { Mamba, Attention, MLP, MOE };
 
 // ---------------------------------------------------------------------------
 // NemotronHModel implementation
@@ -105,14 +105,15 @@ NemotronHModel::NemotronHModel(const std::string& model_path) {
     parse_pattern();
 
     // Count block types
-    int n_mamba = 0, n_attn = 0, n_mlp = 0;
+    int n_mamba = 0, n_attn = 0, n_mlp = 0, n_moe = 0;
     for (auto bt : block_types_) {
         if (bt == BlockType::Mamba) n_mamba++;
         else if (bt == BlockType::Attention) n_attn++;
+        else if (bt == BlockType::MOE) n_moe++;
         else n_mlp++;
     }
     std::cout << "[NemotronH] Pattern: " << n_mamba << " Mamba, " << n_attn << " Attention, "
-              << n_mlp << " MLP blocks" << std::endl;
+              << n_mlp << " MLP, " << n_moe << " MoE blocks" << std::endl;
 
     load_weights(model_path);
     build_ssm_kernel();
@@ -184,6 +185,21 @@ void NemotronHModel::load_config(const std::string& model_path) {
     time_step_max_ = json_float(json, "time_step_max", 0.1f);
     use_conv_bias_ = json_bool(json, "use_conv_bias", true);
 
+    // MoE parameters
+    config_.n_routed_experts = json_int(json, "n_routed_experts", 0);
+    config_.n_shared_experts = json_int(json, "n_shared_experts", 0);
+    config_.moe_shared_expert_intermediate_size = json_int(json, "moe_shared_expert_intermediate_size", 0);
+    config_.routed_scaling_factor = json_float(json, "routed_scaling_factor", 1.0f);
+    config_.n_group = json_int(json, "n_group", 1);
+    config_.topk_group = json_int(json, "topk_group", 1);
+    config_.num_experts_per_tok = json_int(json, "num_experts_per_tok", config_.num_experts_per_tok);
+    config_.moe_intermediate_size = json_int(json, "moe_intermediate_size", config_.moe_intermediate_size);
+    config_.norm_topk_prob = json_bool(json, "norm_topk_prob", config_.norm_topk_prob);
+    // Sync n_routed_experts -> num_experts as fallback
+    if (config_.num_experts == 0 && config_.n_routed_experts > 0) {
+        config_.num_experts = config_.n_routed_experts;
+    }
+
     // Pattern
     hybrid_override_pattern_ = json_value_for_key(json, "hybrid_override_pattern");
 
@@ -204,6 +220,7 @@ void NemotronHModel::parse_pattern() {
             case 'M': block_types_.push_back(BlockType::Mamba); break;
             case '*': block_types_.push_back(BlockType::Attention); break;
             case '-': block_types_.push_back(BlockType::MLP); break;
+            case 'E': block_types_.push_back(BlockType::MOE); break;
             default:
                 throw std::runtime_error("Unknown block type in pattern: " + std::string(1, c));
         }
@@ -751,6 +768,79 @@ mx::array NemotronHModel::mlp_block(const mx::array& x, int layer) {
 }
 
 // ---------------------------------------------------------------------------
+// MoE block: router -> switch_mlp (gather_qmm) -> shared expert
+// ---------------------------------------------------------------------------
+
+mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
+    auto prefix = "layers." + std::to_string(layer) + ".mixer.";
+    int k = config_.num_experts_per_tok;
+    int B_dim = x.shape(0);
+    int L = x.shape(1);
+
+    // 1. Router
+    auto gate_w = get_weight(prefix + "gate.weight");
+    auto logits = mx::matmul(x, mx::transpose(gate_w, {1, 0}));
+    if (has_weight(prefix + "gate.e_score_correction_bias")) {
+        logits = mx::add(logits, get_weight(prefix + "gate.e_score_correction_bias"));
+    }
+    auto scores = mx::softmax(logits, -1);
+
+    // 2. Top-k selection (simplified V1 — skip group selection)
+    auto neg = mx::negative(scores);
+    auto topk_inds = mx::argpartition(neg, k - 1, -1);
+    topk_inds = mx::slice(topk_inds, {0, 0, 0}, {B_dim, L, k});
+    auto topk_scores = mx::take_along_axis(scores, topk_inds, -1);
+
+    // Scale
+    topk_scores = mx::multiply(topk_scores, mx::array(config_.routed_scaling_factor));
+    if (config_.norm_topk_prob) {
+        topk_scores = mx::divide(topk_scores, mx::sum(topk_scores, -1, true));
+    }
+
+    // 3. SwitchMLP: fc1 -> relu^2 -> fc2 (via gather_qmm)
+    auto x_exp = mx::expand_dims(x, {-2, -3});  // [B, L, 1, 1, hidden]
+
+    auto fc1_w = get_weight(prefix + "switch_mlp.fc1.weight");
+    auto fc1_s = get_weight(prefix + "switch_mlp.fc1.scales");
+    std::optional<mx::array> fc1_b = std::nullopt;
+    if (has_weight(prefix + "switch_mlp.fc1.biases")) {
+        fc1_b = get_weight(prefix + "switch_mlp.fc1.biases");
+    }
+
+    auto fc2_w = get_weight(prefix + "switch_mlp.fc2.weight");
+    auto fc2_s = get_weight(prefix + "switch_mlp.fc2.scales");
+    std::optional<mx::array> fc2_b = std::nullopt;
+    if (has_weight(prefix + "switch_mlp.fc2.biases")) {
+        fc2_b = get_weight(prefix + "switch_mlp.fc2.biases");
+    }
+
+    auto h = mx::gather_qmm(x_exp, fc1_w, fc1_s, fc1_b,
+                             std::nullopt, topk_inds, /*transpose=*/true,
+                             config_.quant_group_size, config_.quant_bits, "affine", false);
+    // relu^2
+    h = mx::square(mx::maximum(h, mx::array(0.0f)));
+    h = mx::gather_qmm(h, fc2_w, fc2_s, fc2_b,
+                        std::nullopt, topk_inds, /*transpose=*/true,
+                        config_.quant_group_size, config_.quant_bits, "affine", false);
+
+    h = mx::squeeze(h, -2);  // [B, L, k, hidden]
+
+    // 4. Weighted sum
+    auto y = mx::multiply(h, mx::expand_dims(topk_scores, -1));
+    y = mx::sum(y, -2);  // [B, L, hidden]
+
+    // 5. Shared expert
+    if (config_.n_shared_experts > 0 && has_weight(prefix + "shared_experts.up_proj.weight")) {
+        auto shared = linear(x, prefix + "shared_experts.up_proj");
+        shared = mx::square(mx::maximum(shared, mx::array(0.0f)));  // relu^2
+        shared = linear(shared, prefix + "shared_experts.down_proj");
+        y = mx::add(y, shared);
+    }
+
+    return y;
+}
+
+// ---------------------------------------------------------------------------
 // Mamba state initialization
 // ---------------------------------------------------------------------------
 
@@ -816,6 +906,10 @@ mx::array NemotronHModel::forward(
                 block_out = mlp_block(normed, i);
                 break;
             }
+            case BlockType::MOE: {
+                block_out = moe_block(normed, i);
+                break;
+            }
         }
 
         h = mx::add(h, block_out);
@@ -873,6 +967,10 @@ mx::array NemotronHModel::forward(
             }
             case BlockType::MLP: {
                 block_out = mlp_block(normed, i);
+                break;
+            }
+            case BlockType::MOE: {
+                block_out = moe_block(normed, i);
                 break;
             }
         }
