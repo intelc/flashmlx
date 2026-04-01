@@ -49,17 +49,12 @@ def generate(
     y = _sample(logits, temperature)
     mx.eval(y)
 
-    # Compiled decode step — fuses Metal kernels for single-token forward pass
-    @mx.compile
-    def _decode_step(y):
-        logits = model(y.reshape(1, 1), cache=cache)
-        return logits[:, -1, :]
-
     for _ in range(max_tokens):
         yield y.item()
 
-        # Compute next token using compiled step
-        logits = _decode_step(y)
+        # Compute next token
+        logits = model(y.reshape(1, 1), cache=cache)
+        logits = logits[:, -1, :]
         y = _sample(logits, temperature)
         mx.eval(y)
 
