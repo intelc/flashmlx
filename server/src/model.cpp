@@ -128,6 +128,13 @@ void LlamaModel::load_config(const std::string& model_path) {
         config_.quant_group_size = json_int(quant_obj, "group_size", 64);
     }
 
+    // MoE config
+    config_.num_experts = json_int(json, "num_experts", 0);
+    config_.num_experts_per_tok = json_int(json, "num_experts_per_tok", 0);
+    config_.moe_intermediate_size = json_int(json, "moe_intermediate_size", 0);
+    config_.shared_expert_intermediate_size = json_int(json, "shared_expert_intermediate_size", 0);
+    config_.norm_topk_prob = json_bool(json, "norm_topk_prob", false);
+
     // Use explicit head_dim from config if present, else compute from hidden_size
     head_dim_ = config_.head_dim > 0 ? config_.head_dim : config_.hidden_size / config_.num_attention_heads;
 }
@@ -187,6 +194,13 @@ LlamaModel::LlamaModel(const std::string& model_path) {
               << " vocab=" << config_.vocab_size
               << " quant=" << config_.quant_bits << "bit"
               << std::endl;
+    if (config_.num_experts > 0) {
+        std::cout << "[flashmlx] MoE: " << config_.num_experts << " experts, top-"
+                  << config_.num_experts_per_tok
+                  << ", moe_intermediate=" << config_.moe_intermediate_size
+                  << ", shared_intermediate=" << config_.shared_expert_intermediate_size
+                  << std::endl;
+    }
     load_weights(model_path);
 
     // Detect activation dtype from first layer norm weight

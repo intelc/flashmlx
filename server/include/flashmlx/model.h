@@ -30,6 +30,13 @@ struct ModelConfig {
     // Quantization
     int quant_bits = 0;       // 0 = no quantization
     int quant_group_size = 64;
+
+    // MoE parameters (num_experts == 0 means not MoE)
+    int num_experts = 0;
+    int num_experts_per_tok = 0;
+    int moe_intermediate_size = 0;
+    int shared_expert_intermediate_size = 0;
+    bool norm_topk_prob = false;
 };
 
 class LlamaModel {
