@@ -11,6 +11,7 @@ from huggingface_hub import snapshot_download
 from functools import partial
 
 from engine.attention import scaled_dot_product_attention, create_causal_mask
+from engine.fused_ops import fused_residual_rms_norm, fused_rms_norm
 from engine.kv_cache import KVCache, PreAllocKVCache
 from engine.quantize import QuantConfig
 
@@ -128,15 +129,23 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self._eps = args.rms_norm_eps
 
     def __call__(self, x: mx.array, mask: mx.array | None = None, cache: KVCache | None = None) -> mx.array:
-        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        return h + self.mlp(self.post_attention_layernorm(h))
+        # Fused: input_layernorm then attention
+        normed = fused_rms_norm(x, self.input_layernorm.weight, self._eps)
+        attn_out = self.self_attn(normed, mask, cache)
+        # Fused: residual add + post_attention_layernorm
+        h, normed2 = fused_residual_rms_norm(x, attn_out, self.post_attention_layernorm.weight, self._eps)
+        # MLP
+        mlp_out = self.mlp(normed2)
+        return h + mlp_out
 
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         self.args = args
+        self._eps = args.rms_norm_eps
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -160,7 +169,7 @@ class Model(nn.Module):
             cache = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
             h = layer(h, mask, cache[i])
-        h = self.norm(h)
+        h = fused_rms_norm(h, self.norm.weight, self._eps)
         if self.args.tie_word_embeddings:
             return self.embed_tokens.as_linear(h)
         return self.lm_head(h)
