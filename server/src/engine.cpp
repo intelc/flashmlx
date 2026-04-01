@@ -15,7 +15,7 @@ Engine::Engine(const std::string& model_path, int max_batch_size, int max_contex
 
     // Create KV cache pool using model config
     const auto& cfg = model_->config();
-    int head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    int head_dim = cfg.head_dim > 0 ? cfg.head_dim : cfg.hidden_size / cfg.num_attention_heads;
     kv_pool_ = std::make_unique<KVCachePool>(
         max_batch_size, max_context_len,
         cfg.num_hidden_layers, cfg.num_key_value_heads, head_dim);

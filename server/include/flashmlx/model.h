@@ -17,6 +17,7 @@ struct ModelConfig {
     int num_hidden_layers = 32;
     int num_attention_heads = 32;
     int num_key_value_heads = 8;
+    int head_dim = 0;  // 0 = hidden_size / num_attention_heads
     int vocab_size = 128256;
     int max_position_embeddings = 8192;
     float rms_norm_eps = 1e-5f;
