@@ -1,0 +1,29 @@
+[project]
+name = "flashmlx"
+version = "0.1.0"
+description = "Auto-research driven MLX inference engine for Apple Silicon"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.22.0",
+    "huggingface_hub>=0.20.0",
+    "transformers>=4.40.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.2",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["engine*", "harness*", "autobench*", "baselines*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120

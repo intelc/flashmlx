@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+build/
+harness/baselines.json
+autobench/results.tsv
+*.log
+.DS_Store
+models/
