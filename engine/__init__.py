@@ -1,5 +1,5 @@
 # engine/__init__.py
-from engine.kv_cache import KVCache
+from engine.kv_cache import KVCache, PreAllocKVCache
 from engine.attention import scaled_dot_product_attention, create_causal_mask
 from engine.quantize import QuantConfig
 from engine.model_config import ModelArgs, Model, load_model, detect_architecture

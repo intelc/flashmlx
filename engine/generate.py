@@ -13,6 +13,7 @@ def generate(
     temperature: float = 0.0,
     prefill_chunk_size: int = 2048,
     eval_batch_size: int = 16,
+    prealloc_cache: bool = False,
 ) -> Iterator[int]:
     """Generate tokens autoregressively.
 
@@ -23,6 +24,7 @@ def generate(
         temperature: Sampling temperature (0.0 = greedy)
         prefill_chunk_size: Process prompt in chunks of this size
         eval_batch_size: Number of tokens to compute before evaluating (higher = faster but more latency)
+        prealloc_cache: Use pre-allocated KV cache (better for large models 8B+)
 
     Yields:
         Token IDs one at a time
@@ -33,7 +35,7 @@ def generate(
     # Set generous Metal cache to reduce allocation overhead
     mx.set_cache_limit(4 * 1024 * 1024 * 1024)  # 4GB
 
-    cache = model.make_cache()
+    cache = model.make_cache(prealloc=prealloc_cache)
 
     # Prefill: process prompt in chunks
     prompt = prompt.reshape(1, -1)  # [1, seq_len]

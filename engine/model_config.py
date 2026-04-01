@@ -11,7 +11,7 @@ from huggingface_hub import snapshot_download
 from functools import partial
 
 from engine.attention import scaled_dot_product_attention, create_causal_mask
-from engine.kv_cache import KVCache
+from engine.kv_cache import KVCache, PreAllocKVCache
 from engine.quantize import QuantConfig
 
 
@@ -165,8 +165,9 @@ class Model(nn.Module):
             return self.embed_tokens.as_linear(h)
         return self.lm_head(h)
 
-    def make_cache(self) -> list[KVCache]:
-        return [KVCache() for _ in self.layers]
+    def make_cache(self, prealloc: bool = False) -> list:
+        cls = PreAllocKVCache if prealloc else KVCache
+        return [cls() for _ in self.layers]
 
     def sanitize(self, weights: dict) -> dict:
         return {
