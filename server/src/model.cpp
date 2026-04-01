@@ -174,6 +174,20 @@ LlamaModel::LlamaModel(const std::string& model_path) {
               << " quant=" << config_.quant_bits << "bit"
               << std::endl;
     load_weights(model_path);
+
+    // Pre-dequantize embedding for fast lookup (avoids per-call dequantize)
+    if (has_weight("embed_tokens.scales")) {
+        auto w = get_weight("embed_tokens.weight");
+        auto scales = get_weight("embed_tokens.scales");
+        std::optional<mx::array> biases = std::nullopt;
+        if (has_weight("embed_tokens.biases")) {
+            biases = get_weight("embed_tokens.biases");
+        }
+        auto dequant = mx::dequantize(w, scales, biases, config_.quant_group_size, config_.quant_bits);
+        mx::eval({dequant});
+        weights_.insert_or_assign("_embed_dequantized", dequant);
+        std::cout << "[flashmlx] Pre-dequantized embedding: " << dequant.shape(0) << "x" << dequant.shape(1) << std::endl;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,33 +214,22 @@ mx::array LlamaModel::rms_norm(const mx::array& x, const mx::array& weight) {
 }
 
 mx::array LlamaModel::embed(const mx::array& input_ids) {
-    auto w = get_weight("embed_tokens.weight");
-    if (has_weight("embed_tokens.scales")) {
-        // Quantized embedding — dequantize then take
-        auto scales = get_weight("embed_tokens.scales");
-        std::optional<mx::array> biases = std::nullopt;
-        if (has_weight("embed_tokens.biases")) {
-            biases = get_weight("embed_tokens.biases");
-        }
-        auto dequant_w = mx::dequantize(w, scales, biases, config_.quant_group_size, config_.quant_bits);
-        return mx::take(dequant_w, input_ids, 0);
+    // Use pre-dequantized embedding if available (set during load)
+    if (has_weight("_embed_dequantized")) {
+        return mx::take(get_weight("_embed_dequantized"), input_ids, 0);
     }
+    auto w = get_weight("embed_tokens.weight");
     return mx::take(w, input_ids, 0);
 }
 
 mx::array LlamaModel::lm_head(const mx::array& x) {
     if (config_.tie_word_embeddings) {
-        auto w = get_weight("embed_tokens.weight");
-        if (has_weight("embed_tokens.scales")) {
-            // Quantized tied embedding — dequantize then matmul
-            auto scales = get_weight("embed_tokens.scales");
-            std::optional<mx::array> biases = std::nullopt;
-            if (has_weight("embed_tokens.biases")) {
-                biases = get_weight("embed_tokens.biases");
-            }
-            auto dequant_w = mx::dequantize(w, scales, biases, config_.quant_group_size, config_.quant_bits);
-            return mx::matmul(x, mx::transpose(dequant_w, {1, 0}));
+        // Use pre-dequantized embedding if available
+        if (has_weight("_embed_dequantized")) {
+            auto w = get_weight("_embed_dequantized");
+            return mx::matmul(x, mx::transpose(w, {1, 0}));
         }
+        auto w = get_weight("embed_tokens.weight");
         return mx::matmul(x, mx::transpose(w, {1, 0}));
     }
     // lm_head is NOT under "model." prefix, so it's stored as "lm_head.*"
