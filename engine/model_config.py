@@ -52,6 +52,7 @@ class ModelArgs:
     tie_word_embeddings: bool = True
     attention_bias: bool = False
     mlp_bias: bool = False
+    qk_norm: bool = False
 
     @classmethod
     def from_dict(cls, config: dict) -> "ModelArgs":
@@ -59,8 +60,11 @@ class ModelArgs:
         hidden_size = config["hidden_size"]
         num_key_value_heads = config.get("num_key_value_heads", num_attention_heads)
         head_dim = config.get("head_dim", hidden_size // num_attention_heads)
+        # Detect QK-norm: Qwen3 always uses it; also check explicit config flag
+        model_type = config.get("model_type", "llama")
+        qk_norm = model_type in ("qwen3",) or config.get("qk_norm", False)
         return cls(
-            model_type=config.get("model_type", "llama"),
+            model_type=model_type,
             hidden_size=hidden_size,
             num_hidden_layers=config["num_hidden_layers"],
             intermediate_size=config["intermediate_size"],
@@ -75,6 +79,7 @@ class ModelArgs:
             tie_word_embeddings=config.get("tie_word_embeddings", True),
             attention_bias=config.get("attention_bias", False),
             mlp_bias=config.get("mlp_bias", False),
+            qk_norm=qk_norm,
         )
 
 
@@ -94,12 +99,25 @@ class Attention(nn.Module):
             traditional=args.rope_traditional,
             base=args.rope_theta,
         )
+        # QK-norm (used by Qwen3 and similar models)
+        # Weights are loaded from safetensors if present; if not, these remain
+        # as identity (no-op) since nn.RMSNorm with the loaded weight == identity
+        # when weights are missing (strict=False).
+        if args.qk_norm:
+            self.q_norm = nn.RMSNorm(args.head_dim, eps=args.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(args.head_dim, eps=args.rms_norm_eps)
+        self._qk_norm = args.qk_norm
 
     def __call__(self, x: mx.array, mask: mx.array | None = None, cache: KVCache | None = None) -> mx.array:
         B, L, _ = x.shape
         q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        # Apply QK-norm if present (e.g., Qwen3)
+        if self._qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)

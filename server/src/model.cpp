@@ -275,6 +275,16 @@ mx::array LlamaModel::attention(
     k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
     v = mx::transpose(mx::reshape(v, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
 
+    // Apply QK-norm if weights are present (e.g., Qwen3)
+    std::string q_norm_key = prefix + ".q_norm.weight";
+    std::string k_norm_key = prefix + ".k_norm.weight";
+    if (has_weight(q_norm_key)) {
+        q = rms_norm(q, get_weight(q_norm_key));
+    }
+    if (has_weight(k_norm_key)) {
+        k = rms_norm(k, get_weight(k_norm_key));
+    }
+
     // Apply RoPE
     // RoPE expects [B, n_heads, L, hd]; offset is per-sequence
     // Use the array-based offset overload for batched offsets
@@ -392,6 +402,66 @@ mx::array LlamaModel::forward(
 
     // LM head
     return lm_head(h);
+}
+
+// ---------------------------------------------------------------------------
+// Debug helpers
+// ---------------------------------------------------------------------------
+
+std::vector<float> LlamaModel::debug_embed(const std::vector<int>& token_ids) {
+    auto input = mx::array(token_ids.data(), {1, (int)token_ids.size()}, mx::int32);
+    auto h = embed(input);
+    mx::eval({h});
+
+    std::vector<float> result;
+    // Cast to float32 to read data
+    auto h_f32 = mx::astype(h, mx::float32);
+    h_f32 = mx::reshape(h_f32, {-1});
+    mx::eval({h_f32});
+    const float* ptr = h_f32.data<float>();
+    int total = h_f32.size();
+    for (int i = 0; i < std::min(total, 20); i++) {
+        result.push_back(ptr[i]);
+    }
+    return result;
+}
+
+std::vector<int> LlamaModel::debug_forward(const std::vector<int>& token_ids) {
+    auto input = mx::array(token_ids.data(), {1, (int)token_ids.size()}, mx::int32);
+
+    int n_layers = config_.num_hidden_layers;
+    int n_kv = config_.num_key_value_heads;
+    int hd = head_dim_;
+    int ctx = 512;
+
+    std::vector<mx::array> cache_k, cache_v;
+    for (int i = 0; i < n_layers; i++) {
+        cache_k.push_back(mx::zeros({1, n_kv, ctx, hd}, mx::float16));
+        cache_v.push_back(mx::zeros({1, n_kv, ctx, hd}, mx::float16));
+    }
+    mx::eval(cache_k);
+    mx::eval(cache_v);
+
+    auto cache_offsets = mx::array({0}, mx::int32);
+    auto logits = forward(input, cache_k, cache_v, cache_offsets);
+    mx::eval({logits});
+
+    // Get logits for last position
+    int seq_len = logits.shape(1);
+    auto last_logits = mx::slice(logits, {0, seq_len - 1, 0}, {1, seq_len, logits.shape(2)});
+    last_logits = mx::reshape(last_logits, {-1});
+
+    // Get top 10 tokens
+    auto neg_logits = mx::negative(last_logits);
+    auto top_indices = mx::argpartition(neg_logits, 10);
+    mx::eval({top_indices});
+
+    std::vector<int> result;
+    const int32_t* ptr = top_indices.data<int32_t>();
+    for (int i = 0; i < 10; i++) {
+        result.push_back(ptr[i]);
+    }
+    return result;
 }
 
 } // namespace flashmlx

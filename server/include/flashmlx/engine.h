@@ -39,6 +39,8 @@ public:
     std::string ping() const;
     void start();
     void stop();
+    std::vector<int> debug_forward(const std::vector<int>& token_ids);
+    std::vector<float> debug_embed(const std::vector<int>& token_ids);
 
 private:
     std::unique_ptr<LlamaModel> model_;

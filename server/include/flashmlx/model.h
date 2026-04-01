@@ -42,6 +42,12 @@ public:
 
     const ModelConfig& config() const { return config_; }
 
+    /// Debug: run forward pass and return top-5 token IDs from last position
+    std::vector<int> debug_forward(const std::vector<int>& token_ids);
+
+    /// Debug: return embedding for given token IDs as flat float vector
+    std::vector<float> debug_embed(const std::vector<int>& token_ids);
+
 private:
     void load_config(const std::string& model_path);
     void load_weights(const std::string& model_path);

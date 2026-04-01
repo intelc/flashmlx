@@ -111,6 +111,14 @@ void Engine::loop() {
     }
 }
 
+std::vector<int> Engine::debug_forward(const std::vector<int>& token_ids) {
+    return model_->debug_forward(token_ids);
+}
+
+std::vector<float> Engine::debug_embed(const std::vector<int>& token_ids) {
+    return model_->debug_embed(token_ids);
+}
+
 } // namespace flashmlx
 
 PYBIND11_MODULE(_flashmlx_engine, m) {
@@ -141,5 +149,7 @@ PYBIND11_MODULE(_flashmlx_engine, m) {
         .def("poll_tokens", &flashmlx::Engine::poll_tokens,
              py::call_guard<py::gil_scoped_release>())
         .def("start", &flashmlx::Engine::start)
-        .def("stop", &flashmlx::Engine::stop);
+        .def("stop", &flashmlx::Engine::stop)
+        .def("debug_forward", &flashmlx::Engine::debug_forward)
+        .def("debug_embed", &flashmlx::Engine::debug_embed);
 }
