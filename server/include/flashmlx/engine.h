@@ -1,8 +1,11 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <map>
+
+#include "flashmlx/model.h"
 
 namespace flashmlx {
 
@@ -25,6 +28,7 @@ private:
     int max_batch_size_;
     int max_context_len_;
     int total_requests_ = 0;
+    std::unique_ptr<LlamaModel> model_;
 };
 
 } // namespace flashmlx

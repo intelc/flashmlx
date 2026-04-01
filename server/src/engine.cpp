@@ -7,7 +7,9 @@ namespace py = pybind11;
 namespace flashmlx {
 
 Engine::Engine(const std::string& model_path, int max_batch_size, int max_context_len)
-    : model_path_(model_path), max_batch_size_(max_batch_size), max_context_len_(max_context_len) {}
+    : model_path_(model_path), max_batch_size_(max_batch_size), max_context_len_(max_context_len) {
+    model_ = std::make_unique<LlamaModel>(model_path);
+}
 
 Engine::~Engine() = default;
 

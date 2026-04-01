@@ -21,6 +21,7 @@ find_package(pybind11 REQUIRED)
 # Build the extension module
 pybind11_add_module(_flashmlx_engine
     src/engine.cpp
+    src/model.cpp
 )
 target_include_directories(_flashmlx_engine PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
