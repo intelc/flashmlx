@@ -7,7 +7,7 @@ MODEL_REPO = "mlx-community/Meta-Llama-3-8B-4bit"
 PROMPT_TOKENS = list(range(1, 129))  # 128 tokens
 GEN_TOKENS = 128
 NUM_RUNS = 5
-WARMUP_TOKENS = 20
+WARMUP_TOKENS = 128
 
 
 def bench():
