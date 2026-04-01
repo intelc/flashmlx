@@ -224,13 +224,23 @@ mx::array LlamaModel::embed(const mx::array& input_ids) {
 
 mx::array LlamaModel::lm_head(const mx::array& x) {
     if (config_.tie_word_embeddings) {
-        // Use pre-dequantized embedding if available
-        if (has_weight("_embed_dequantized")) {
-            auto w = get_weight("_embed_dequantized");
-            return mx::matmul(x, mx::transpose(w, {1, 0}));
+        // Use quantized_matmul for tied embeddings (4x less bandwidth than dequantized)
+        if (has_weight("embed_tokens.scales")) {
+            auto w = get_weight("embed_tokens.weight");
+            auto scales = get_weight("embed_tokens.scales");
+            std::optional<mx::array> biases = std::nullopt;
+            if (has_weight("embed_tokens.biases")) {
+                biases = get_weight("embed_tokens.biases");
+            }
+            return mx::quantized_matmul(x, w, scales, biases,
+                                        /*transpose=*/true,
+                                        config_.quant_group_size, config_.quant_bits);
         }
-        auto w = get_weight("embed_tokens.weight");
-        return mx::matmul(x, mx::transpose(w, {1, 0}));
+        // Non-quantized: use pre-dequantized if available, else raw
+        if (has_weight("_embed_dequantized")) {
+            return mx::matmul(x, mx::transpose(get_weight("_embed_dequantized"), {1, 0}));
+        }
+        return mx::matmul(x, mx::transpose(get_weight("embed_tokens.weight"), {1, 0}));
     }
     // lm_head is NOT under "model." prefix, so it's stored as "lm_head.*"
     return linear(x, "lm_head");
