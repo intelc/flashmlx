@@ -8,9 +8,16 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
+from functools import partial
+
 from engine.attention import scaled_dot_product_attention, create_causal_mask
 from engine.kv_cache import KVCache
 from engine.quantize import QuantConfig
+
+
+@partial(mx.compile, shapeless=True)
+def _swiglu(gate, x):
+    return nn.silu(gate) * x
 
 
 # Models that use the Llama architecture (GQA + SwiGLU + RMSNorm)
@@ -112,7 +119,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=args.mlp_bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(_swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):
