@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -232,6 +233,24 @@ private:
     mx::array mlp_block(const mx::array& x, int layer);
     mx::array moe_block(const mx::array& x, int layer);
 
+    // Functional (stateless) versions for compiled forward pass
+    // Returns: {output, new_conv_state, new_ssm_state}
+    std::vector<mx::array> mamba_block_functional(
+        const mx::array& x, int layer,
+        const mx::array& conv_state, const mx::array& ssm_state);
+    // Returns: {output, new_cache_k, new_cache_v}
+    std::vector<mx::array> attention_block_functional(
+        const mx::array& x, int layer,
+        const mx::array& cache_k, const mx::array& cache_v, int cache_offset);
+
+    // Compiled forward step: init + run
+    void init_compiled_step();
+    mx::array compiled_decode(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        int cache_offset);
+
     mx::array get_weight(const std::string& name) const;
     bool has_weight(const std::string& name) const;
 
@@ -268,6 +287,67 @@ private:
     std::vector<mx::array> mamba_conv_states_;   // one per Mamba block
     std::vector<mx::array> mamba_ssm_states_;    // one per Mamba block
     bool mamba_states_initialized_ = false;
+
+    // Compiled forward step function
+    std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_step_;
+    bool compiled_step_initialized_ = false;
+
+    // Per-mamba-layer compiled mixer functions
+    // Each takes {x, conv_state, ssm_state} and returns {output, new_conv, new_ssm}
+    std::vector<std::function<std::vector<mx::array>(const std::vector<mx::array>&)>> compiled_mamba_mixers_;
+    bool compiled_mamba_mixers_initialized_ = false;
+    void init_compiled_mamba_mixers();
+
+    // Pre-cached weight references to avoid hash lookups in hot loop
+    // All fields use std::optional because mx::array has no default constructor.
+    struct MambaLayerWeights {
+        std::optional<mx::array> norm_w;
+        std::optional<mx::array> in_proj_w, in_proj_s;
+        std::optional<mx::array> in_proj_b;
+        std::optional<mx::array> conv1d_w;
+        std::optional<mx::array> conv1d_bias;
+        std::optional<mx::array> dt_bias, A_log, D_param, mixer_norm_w;
+        std::optional<mx::array> out_proj_w, out_proj_s;
+        std::optional<mx::array> out_proj_b;
+    };
+    struct AttnLayerWeights {
+        std::optional<mx::array> norm_w;
+        std::optional<mx::array> q_w, q_s, k_w, k_s, v_w, v_s, o_w, o_s;
+        std::optional<mx::array> q_b, k_b, v_b, o_b;
+    };
+    struct MoELayerWeights {
+        std::optional<mx::array> norm_w;
+        std::optional<mx::array> gate_w;
+        std::optional<mx::array> gate_correction_bias;
+        std::optional<mx::array> fc1_w, fc1_s, fc2_w, fc2_s;
+        std::optional<mx::array> fc1_b, fc2_b;
+        bool has_shared_expert = false;
+        std::optional<mx::array> shared_up_w, shared_up_s, shared_down_w, shared_down_s;
+        std::optional<mx::array> shared_up_b, shared_down_b;
+    };
+    struct MLPLayerWeights {
+        std::optional<mx::array> norm_w;
+        std::optional<mx::array> up_w, up_s, down_w, down_s;
+        std::optional<mx::array> up_b, down_b;
+    };
+
+    // Indexed by absolute layer index
+    std::vector<std::optional<MambaLayerWeights>> mamba_layer_weights_;
+    std::vector<std::optional<AttnLayerWeights>> attn_layer_weights_;
+    std::vector<std::optional<MoELayerWeights>> moe_layer_weights_;
+    std::vector<std::optional<MLPLayerWeights>> mlp_layer_weights_;
+    void build_weight_cache();
+    bool weight_cache_built_ = false;
+
+    // Fast linear using pre-resolved weights (no hash lookup)
+    mx::array linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,
+                          const std::optional<mx::array>& b);
+    // Fast mamba block using cached weights
+    mx::array mamba_block_fast(const mx::array& x, int layer, int mamba_idx);
+    // Fast mamba block functional using cached weights
+    std::vector<mx::array> mamba_block_functional_fast(
+        const mx::array& x, int layer,
+        const mx::array& conv_state, const mx::array& ssm_state);
 };
 
 } // namespace flashmlx

@@ -367,6 +367,185 @@ mx::array NemotronHModel::linear(const mx::array& x, const std::string& prefix) 
     return mx::matmul(x, mx::transpose(w, {1, 0}));
 }
 
+mx::array NemotronHModel::linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,
+                                      const std::optional<mx::array>& b) {
+    return mx::quantized_matmul(x, w, s, b, /*transpose=*/true,
+                                config_.quant_group_size, config_.quant_bits);
+}
+
+void NemotronHModel::build_weight_cache() {
+    int n_layers = config_.num_hidden_layers;
+    mamba_layer_weights_.resize(n_layers);
+    attn_layer_weights_.resize(n_layers);
+    moe_layer_weights_.resize(n_layers);
+    mlp_layer_weights_.resize(n_layers);
+
+    for (int i = 0; i < n_layers; i++) {
+        std::string lp = "layers." + std::to_string(i);
+        std::string mp = lp + ".mixer";
+
+        switch (block_types_[i]) {
+            case BlockType::Mamba: {
+                MambaLayerWeights w;
+                w.norm_w = get_weight(lp + ".norm.weight");
+                w.in_proj_w = get_weight(mp + ".in_proj.weight");
+                w.in_proj_s = get_weight(mp + ".in_proj.scales");
+                if (has_weight(mp + ".in_proj.biases"))
+                    w.in_proj_b = get_weight(mp + ".in_proj.biases");
+                w.conv1d_w = get_weight(mp + ".conv1d.weight");
+                if (use_conv_bias_ && has_weight(mp + ".conv1d.bias"))
+                    w.conv1d_bias = get_weight(mp + ".conv1d.bias");
+                w.dt_bias = get_weight(mp + ".dt_bias");
+                w.A_log = get_weight(mp + ".A_log");
+                w.D_param = get_weight(mp + ".D");
+                w.mixer_norm_w = get_weight(mp + ".norm.weight");
+                w.out_proj_w = get_weight(mp + ".out_proj.weight");
+                w.out_proj_s = get_weight(mp + ".out_proj.scales");
+                if (has_weight(mp + ".out_proj.biases"))
+                    w.out_proj_b = get_weight(mp + ".out_proj.biases");
+                mamba_layer_weights_[i] = std::move(w);
+                break;
+            }
+            case BlockType::Attention: {
+                AttnLayerWeights w;
+                w.norm_w = get_weight(lp + ".norm.weight");
+                w.q_w = get_weight(mp + ".q_proj.weight");
+                w.q_s = get_weight(mp + ".q_proj.scales");
+                w.k_w = get_weight(mp + ".k_proj.weight");
+                w.k_s = get_weight(mp + ".k_proj.scales");
+                w.v_w = get_weight(mp + ".v_proj.weight");
+                w.v_s = get_weight(mp + ".v_proj.scales");
+                w.o_w = get_weight(mp + ".o_proj.weight");
+                w.o_s = get_weight(mp + ".o_proj.scales");
+                if (has_weight(mp + ".q_proj.biases")) w.q_b = get_weight(mp + ".q_proj.biases");
+                if (has_weight(mp + ".k_proj.biases")) w.k_b = get_weight(mp + ".k_proj.biases");
+                if (has_weight(mp + ".v_proj.biases")) w.v_b = get_weight(mp + ".v_proj.biases");
+                if (has_weight(mp + ".o_proj.biases")) w.o_b = get_weight(mp + ".o_proj.biases");
+                attn_layer_weights_[i] = std::move(w);
+                break;
+            }
+            case BlockType::MOE: {
+                MoELayerWeights w;
+                w.norm_w = get_weight(lp + ".norm.weight");
+                w.gate_w = get_weight(mp + ".gate.weight");
+                if (has_weight(mp + ".gate.e_score_correction_bias"))
+                    w.gate_correction_bias = get_weight(mp + ".gate.e_score_correction_bias");
+                w.fc1_w = get_weight(mp + ".switch_mlp.fc1.weight");
+                w.fc1_s = get_weight(mp + ".switch_mlp.fc1.scales");
+                w.fc2_w = get_weight(mp + ".switch_mlp.fc2.weight");
+                w.fc2_s = get_weight(mp + ".switch_mlp.fc2.scales");
+                if (has_weight(mp + ".switch_mlp.fc1.biases"))
+                    w.fc1_b = get_weight(mp + ".switch_mlp.fc1.biases");
+                if (has_weight(mp + ".switch_mlp.fc2.biases"))
+                    w.fc2_b = get_weight(mp + ".switch_mlp.fc2.biases");
+                if (config_.n_shared_experts > 0 && has_weight(mp + ".shared_experts.up_proj.weight")) {
+                    w.has_shared_expert = true;
+                    w.shared_up_w = get_weight(mp + ".shared_experts.up_proj.weight");
+                    w.shared_up_s = get_weight(mp + ".shared_experts.up_proj.scales");
+                    w.shared_down_w = get_weight(mp + ".shared_experts.down_proj.weight");
+                    w.shared_down_s = get_weight(mp + ".shared_experts.down_proj.scales");
+                    if (has_weight(mp + ".shared_experts.up_proj.biases"))
+                        w.shared_up_b = get_weight(mp + ".shared_experts.up_proj.biases");
+                    if (has_weight(mp + ".shared_experts.down_proj.biases"))
+                        w.shared_down_b = get_weight(mp + ".shared_experts.down_proj.biases");
+                }
+                moe_layer_weights_[i] = std::move(w);
+                break;
+            }
+            case BlockType::MLP: {
+                MLPLayerWeights w;
+                w.norm_w = get_weight(lp + ".norm.weight");
+                w.up_w = get_weight(mp + ".up_proj.weight");
+                w.up_s = get_weight(mp + ".up_proj.scales");
+                w.down_w = get_weight(mp + ".down_proj.weight");
+                w.down_s = get_weight(mp + ".down_proj.scales");
+                if (has_weight(mp + ".up_proj.biases"))
+                    w.up_b = get_weight(mp + ".up_proj.biases");
+                if (has_weight(mp + ".down_proj.biases"))
+                    w.down_b = get_weight(mp + ".down_proj.biases");
+                mlp_layer_weights_[i] = std::move(w);
+                break;
+            }
+        }
+    }
+
+    weight_cache_built_ = true;
+    std::cout << "[NemotronH] Weight cache built for " << n_layers << " layers" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Fast mamba block using cached weights (no hash lookups)
+// ---------------------------------------------------------------------------
+
+std::vector<mx::array> NemotronHModel::mamba_block_functional_fast(
+    const mx::array& x, int layer,
+    const mx::array& conv_state, const mx::array& ssm_state) {
+
+    auto& w = *mamba_layer_weights_[layer];
+    int B_dim = x.shape(0);
+
+    // in_proj
+    auto proj = linear_fast(x, *w.in_proj_w, *w.in_proj_s, w.in_proj_b);
+
+    int gate_size = d_inner_;
+    int dt_size = mamba_num_heads_;
+
+    auto gate = mx::slice(proj, {0, 0, 0}, {B_dim, 1, gate_size});
+    auto conv_input = mx::slice(proj, {0, 0, gate_size}, {B_dim, 1, gate_size + conv_dim_});
+    auto dt = mx::slice(proj, {0, 0, gate_size + conv_dim_}, {B_dim, 1, gate_size + conv_dim_ + dt_size});
+
+    // Conv1d
+    auto full_window = mx::concatenate({conv_state, conv_input}, 1);
+    auto new_conv_state = mx::slice(full_window, {0, 1, 0}, {B_dim, conv_kernel_, conv_dim_});
+    auto conv_out = mx::conv1d(full_window, *w.conv1d_w, 1, 0, 1, conv_dim_);
+    if (w.conv1d_bias) conv_out = mx::add(conv_out, *w.conv1d_bias);
+    conv_out = mx::multiply(conv_out, mx::sigmoid(conv_out));
+
+    // Split
+    auto hidden_states = mx::slice(conv_out, {0, 0, 0}, {B_dim, 1, d_inner_});
+    int bc_size = n_groups_ * ssm_state_size_;
+    auto B_ssm = mx::slice(conv_out, {0, 0, d_inner_}, {B_dim, 1, d_inner_ + bc_size});
+    auto C_ssm = mx::slice(conv_out, {0, 0, d_inner_ + bc_size}, {B_dim, 1, d_inner_ + 2 * bc_size});
+
+    hidden_states = mx::reshape(hidden_states, {B_dim, mamba_num_heads_, mamba_head_dim_});
+    B_ssm = mx::reshape(B_ssm, {B_dim, n_groups_, ssm_state_size_});
+    C_ssm = mx::reshape(C_ssm, {B_dim, n_groups_, ssm_state_size_});
+
+    dt = compute_dt(dt, *w.dt_bias, time_step_min_, time_step_max_);
+    dt = mx::reshape(dt, {B_dim, mamba_num_heads_});
+
+    int G = mamba_num_heads_ / n_groups_;
+    auto ssm_out_shape = mx::Shape{B_dim, mamba_num_heads_, mamba_head_dim_};
+    auto ssm_state_shape = mx::Shape{B_dim, mamba_num_heads_, mamba_head_dim_, ssm_state_size_};
+
+    auto kernel_results = ssm_kernel_(
+        {hidden_states, *w.A_log, B_ssm, C_ssm, *w.D_param, dt, ssm_state},
+        {ssm_out_shape, ssm_state_shape},
+        {config_.activation_dtype, config_.activation_dtype},
+        std::make_tuple(32, mamba_head_dim_, B_dim * mamba_num_heads_),
+        std::make_tuple(32, 1, 1),
+        {{"T", config_.activation_dtype},
+         {"Dh", mamba_head_dim_},
+         {"Ds", ssm_state_size_},
+         {"H", mamba_num_heads_},
+         {"G", G}},
+        std::nullopt, false, {});
+
+    auto y = mx::reshape(kernel_results[0], {B_dim, 1, d_inner_});
+    auto new_ssm_state = kernel_results[1];
+
+    // MambaRMSNormGated
+    auto gated = swiglu_nh(gate, y);
+    int group_dim = d_inner_ / n_groups_;
+    gated = mx::reshape(gated, {B_dim, 1, n_groups_, group_dim});
+    gated = mx::fast::rms_norm(gated, std::nullopt, config_.rms_norm_eps);
+    gated = mx::reshape(gated, {B_dim, 1, d_inner_});
+    gated = mx::multiply(gated, *w.mixer_norm_w);
+
+    auto output = linear_fast(gated, *w.out_proj_w, *w.out_proj_s, w.out_proj_b);
+    return {output, new_conv_state, new_ssm_state};
+}
+
 mx::array NemotronHModel::embed(const mx::array& input_ids) {
     if (has_weight("_embed_dequantized")) {
         return mx::take(get_weight("_embed_dequantized"), input_ids, 0);
@@ -918,6 +1097,396 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
 }
 
 // ---------------------------------------------------------------------------
+// Functional Mamba block (stateless — for compiled forward)
+// Returns: {output, new_conv_state, new_ssm_state}
+// Only handles L==1 (single-token decode)
+// ---------------------------------------------------------------------------
+
+std::vector<mx::array> NemotronHModel::mamba_block_functional(
+    const mx::array& x, int layer,
+    const mx::array& conv_state, const mx::array& ssm_state) {
+
+    int B_dim = x.shape(0);
+    int L = 1;  // Always single-token decode
+
+    std::string prefix = "layers." + std::to_string(layer) + ".mixer";
+
+    // in_proj
+    auto proj = linear(x, prefix + ".in_proj");
+
+    int gate_size = d_inner_;
+    int dt_size = mamba_num_heads_;
+
+    auto gate = mx::slice(proj, {0, 0, 0}, {B_dim, L, gate_size});
+    auto conv_input = mx::slice(proj, {0, 0, gate_size}, {B_dim, L, gate_size + conv_dim_});
+    auto dt = mx::slice(proj, {0, 0, gate_size + conv_dim_}, {B_dim, L, gate_size + conv_dim_ + dt_size});
+
+    // Conv1d with explicit state
+    auto conv_w = get_weight(prefix + ".conv1d.weight");
+    auto full_window = mx::concatenate({conv_state, conv_input}, 1);
+
+    // New conv state: drop oldest, keep last conv_kernel-1
+    auto new_conv_state = mx::slice(full_window, {0, 1, 0}, {B_dim, conv_kernel_, conv_dim_});
+
+    // Depthwise conv1d
+    auto conv_out = mx::conv1d(full_window, conv_w, /*stride=*/1, /*padding=*/0,
+                               /*dilation=*/1, /*groups=*/conv_dim_);
+
+    if (use_conv_bias_) {
+        auto conv_b = get_weight(prefix + ".conv1d.bias");
+        conv_out = mx::add(conv_out, conv_b);
+    }
+
+    // SiLU
+    conv_out = mx::multiply(conv_out, mx::sigmoid(conv_out));
+
+    // Split conv output
+    auto hidden_states = mx::slice(conv_out, {0, 0, 0}, {B_dim, 1, d_inner_});
+    int bc_size = n_groups_ * ssm_state_size_;
+    auto B_ssm = mx::slice(conv_out, {0, 0, d_inner_}, {B_dim, 1, d_inner_ + bc_size});
+    auto C_ssm = mx::slice(conv_out, {0, 0, d_inner_ + bc_size}, {B_dim, 1, d_inner_ + 2 * bc_size});
+
+    // Reshape for SSM
+    hidden_states = mx::reshape(hidden_states, {B_dim, mamba_num_heads_, mamba_head_dim_});
+    B_ssm = mx::reshape(B_ssm, {B_dim, n_groups_, ssm_state_size_});
+    C_ssm = mx::reshape(C_ssm, {B_dim, n_groups_, ssm_state_size_});
+
+    // Compute dt
+    auto dt_bias = get_weight(prefix + ".dt_bias");
+    dt = compute_dt(dt, dt_bias, time_step_min_, time_step_max_);
+    dt = mx::reshape(dt, {B_dim, mamba_num_heads_});
+
+    // SSM kernel
+    auto A_log = get_weight(prefix + ".A_log");
+    auto D_param = get_weight(prefix + ".D");
+    int G = mamba_num_heads_ / n_groups_;
+
+    auto ssm_out_shape = mx::Shape{B_dim, mamba_num_heads_, mamba_head_dim_};
+    auto ssm_state_shape = mx::Shape{B_dim, mamba_num_heads_, mamba_head_dim_, ssm_state_size_};
+
+    auto kernel_results = ssm_kernel_(
+        {hidden_states, A_log, B_ssm, C_ssm, D_param, dt, ssm_state},
+        {ssm_out_shape, ssm_state_shape},
+        {config_.activation_dtype, config_.activation_dtype},
+        std::make_tuple(32, mamba_head_dim_, B_dim * mamba_num_heads_),
+        std::make_tuple(32, 1, 1),
+        {{"T", config_.activation_dtype},
+         {"Dh", mamba_head_dim_},
+         {"Ds", ssm_state_size_},
+         {"H", mamba_num_heads_},
+         {"G", G}},
+        std::nullopt,
+        false,
+        {});
+
+    auto y = kernel_results[0];
+    auto new_ssm_state = kernel_results[1];
+
+    // Reshape y: [B, n_heads, head_dim] -> [B, 1, d_inner]
+    y = mx::reshape(y, {B_dim, 1, d_inner_});
+
+    // MambaRMSNormGated
+    auto gated = swiglu_nh(gate, y);
+
+    int group_dim = d_inner_ / n_groups_;
+    gated = mx::reshape(gated, {B_dim, 1, n_groups_, group_dim});
+    gated = mx::fast::rms_norm(gated, std::nullopt, config_.rms_norm_eps);
+    gated = mx::reshape(gated, {B_dim, 1, d_inner_});
+
+    auto norm_w = get_weight(prefix + ".norm.weight");
+    gated = mx::multiply(gated, norm_w);
+
+    auto output = linear(gated, prefix + ".out_proj");
+    return {output, new_conv_state, new_ssm_state};
+}
+
+// ---------------------------------------------------------------------------
+// Functional Attention block (stateless — for compiled forward)
+// Returns: {output, new_cache_k, new_cache_v}
+// Only handles L==1 (single-token decode)
+// ---------------------------------------------------------------------------
+
+std::vector<mx::array> NemotronHModel::attention_block_functional(
+    const mx::array& x, int layer,
+    const mx::array& cache_k, const mx::array& cache_v, int cache_offset) {
+
+    std::string prefix = "layers." + std::to_string(layer) + ".mixer";
+
+    int B_dim = x.shape(0);
+    int L = x.shape(1);
+    int n_heads = config_.num_attention_heads;
+    int n_kv_heads = config_.num_key_value_heads;
+    int hd = attn_head_dim_;
+
+    auto q = linear(x, prefix + ".q_proj");
+    auto k = linear(x, prefix + ".k_proj");
+    auto v = linear(x, prefix + ".v_proj");
+
+    q = mx::transpose(mx::reshape(q, {B_dim, L, n_heads, hd}), {0, 2, 1, 3});
+    k = mx::transpose(mx::reshape(k, {B_dim, L, n_kv_heads, hd}), {0, 2, 1, 3});
+    v = mx::transpose(mx::reshape(v, {B_dim, L, n_kv_heads, hd}), {0, 2, 1, 3});
+
+    // NO RoPE for Nemotron-H
+
+    auto new_cache_k = mx::slice_update(
+        cache_k, k,
+        {0, 0, cache_offset, 0},
+        {B_dim, n_kv_heads, cache_offset + L, hd});
+    auto new_cache_v = mx::slice_update(
+        cache_v, v,
+        {0, 0, cache_offset, 0},
+        {B_dim, n_kv_heads, cache_offset + L, hd});
+
+    int total_len = cache_offset + L;
+    auto full_k = mx::slice(new_cache_k, {0, 0, 0, 0}, {B_dim, n_kv_heads, total_len, hd});
+    auto full_v = mx::slice(new_cache_v, {0, 0, 0, 0}, {B_dim, n_kv_heads, total_len, hd});
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    auto attn_out = mx::fast::scaled_dot_product_attention(
+        q, full_k, full_v, scale, "");
+
+    attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B_dim, L, n_heads * hd});
+
+    auto output = linear(attn_out, prefix + ".o_proj");
+    return {output, new_cache_k, new_cache_v};
+}
+
+// ---------------------------------------------------------------------------
+// Compiled forward step initialization
+// ---------------------------------------------------------------------------
+
+void NemotronHModel::init_compiled_step() {
+    compiled_step_initialized_ = true;
+    // No-op: full-forward compilation not used due to KV cache offset issue.
+    // Per-mamba-layer compilation is initialized in init_compiled_mamba_mixers().
+}
+
+// ---------------------------------------------------------------------------
+// Compiled per-mamba-layer mixer functions
+// Each compiled function: {x, conv_state, ssm_state} -> {output, new_conv, new_ssm}
+// Shapes are constant for L=1, B=1 decode, so each traces once.
+// ---------------------------------------------------------------------------
+
+void NemotronHModel::init_compiled_mamba_mixers() {
+    // Build weight cache first
+    if (!weight_cache_built_) {
+        build_weight_cache();
+    }
+
+    compiled_mamba_mixers_.clear();
+    compiled_mamba_mixers_.reserve(config_.num_hidden_layers);
+
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        if (block_types_[i] != BlockType::Mamba) {
+            compiled_mamba_mixers_.push_back(nullptr);
+            continue;
+        }
+
+        auto& self = *this;
+        int layer = i;
+
+        std::function<std::vector<mx::array>(const std::vector<mx::array>&)> mixer_fn =
+            [&self, layer](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+                return self.mamba_block_functional_fast(inputs[0], layer, inputs[1], inputs[2]);
+            };
+
+        compiled_mamba_mixers_.push_back(mx::compile(mixer_fn, /*shapeless=*/false));
+    }
+
+    compiled_mamba_mixers_initialized_ = true;
+    std::cout << "[NemotronH] Compiled " << num_mamba_layers_
+              << " mamba mixer functions (with weight cache)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Compiled decode: functional forward with compiled mamba mixers
+// ---------------------------------------------------------------------------
+
+mx::array NemotronHModel::compiled_decode(
+    const mx::array& input_ids,
+    std::vector<mx::array>& cache_keys,
+    std::vector<mx::array>& cache_values,
+    int cache_offset) {
+
+    if (!compiled_mamba_mixers_initialized_) {
+        init_compiled_mamba_mixers();
+    }
+
+    if (!compiled_step_initialized_) {
+        // Build the full-forward compiled function
+        auto& self = *this;
+        int n_heads = config_.num_attention_heads;
+        int n_kv_heads = config_.num_key_value_heads;
+        int hd = attn_head_dim_;
+        int n_layers = config_.num_hidden_layers;
+
+        std::function<std::vector<mx::array>(const std::vector<mx::array>&)> step_fn =
+            [&self, n_heads, n_kv_heads, hd, n_layers](
+                const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+                // Input layout:
+                // [0] = input_ids [B, 1]
+                // [1] = offset_arr [1] (int32 scalar)
+                // [2 .. 2+2*num_attn-1] = KV caches (k, v pairs) [B, n_kv, max_ctx, hd]
+                // [2+2*num_attn .. +num_mamba-1] = conv states
+                // [next .. +num_mamba-1] = ssm states
+
+                int idx = 0;
+                auto input_ids = inputs[idx++];
+                auto offset_arr = inputs[idx++];  // [1] int32
+
+                int kv_base = idx;
+                int conv_base = kv_base + self.num_attn_layers_ * 2;
+                int ssm_base = conv_base + self.num_mamba_layers_;
+
+                auto h = self.embed(input_ids);
+                int B_dim = h.shape(0);
+
+                std::vector<mx::array> out_kv;       // updated kv caches
+                std::vector<mx::array> out_conv;      // updated conv states
+                std::vector<mx::array> out_ssm;       // updated ssm states
+
+                int kv_idx = kv_base;
+                int conv_idx = conv_base;
+                int ssm_idx = ssm_base;
+
+                // Pre-build index for put_along_axis: offset broadcast to [B, n_kv, 1, hd]
+                auto kv_index = mx::broadcast_to(
+                    mx::reshape(offset_arr, {1, 1, 1, 1}),
+                    {B_dim, n_kv_heads, 1, hd});
+
+                // Pre-build attention mask: valid positions <= offset have 0, rest -inf
+                // mask input is at the end of the inputs vector
+                auto attn_mask = inputs.back();  // [1, 1, 1, max_ctx]
+
+                for (int i = 0; i < n_layers; i++) {
+                    std::optional<mx::array> block_out;
+
+                    switch (self.block_types_[i]) {
+                        case BlockType::Mamba: {
+                            auto& mw = *self.mamba_layer_weights_[i];
+                            auto normed = self.rms_norm(h, *mw.norm_w);
+
+                            auto conv_state = inputs[conv_idx];
+                            auto ssm_state = inputs[ssm_idx];
+                            auto results = self.mamba_block_functional_fast(
+                                normed, i, conv_state, ssm_state);
+                            block_out = results[0];
+                            out_conv.push_back(results[1]);
+                            out_ssm.push_back(results[2]);
+                            conv_idx++;
+                            ssm_idx++;
+                            break;
+                        }
+                        case BlockType::Attention: {
+                            auto& aw = *self.attn_layer_weights_[i];
+                            auto normed = self.rms_norm(h, *aw.norm_w);
+
+                            auto q = self.linear_fast(normed, *aw.q_w, *aw.q_s, aw.q_b);
+                            auto k = self.linear_fast(normed, *aw.k_w, *aw.k_s, aw.k_b);
+                            auto v = self.linear_fast(normed, *aw.v_w, *aw.v_s, aw.v_b);
+
+                            q = mx::transpose(mx::reshape(q, {B_dim, 1, n_heads, hd}), {0, 2, 1, 3});
+                            k = mx::transpose(mx::reshape(k, {B_dim, 1, n_kv_heads, hd}), {0, 2, 1, 3});
+                            v = mx::transpose(mx::reshape(v, {B_dim, 1, n_kv_heads, hd}), {0, 2, 1, 3});
+
+                            // KV cache update using put_along_axis (array-indexed, compilable)
+                            auto ck = inputs[kv_idx];
+                            auto cv = inputs[kv_idx + 1];
+                            ck = mx::put_along_axis(ck, kv_index, k, 2);
+                            cv = mx::put_along_axis(cv, kv_index, v, 2);
+
+                            // SDPA with mask to ignore positions beyond offset
+                            float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+                            auto attn_out = mx::fast::scaled_dot_product_attention(
+                                q, ck, cv, scale, /*mask_mode=*/"", /*mask_arr=*/attn_mask);
+                            attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}),
+                                                   {B_dim, 1, n_heads * hd});
+                            block_out = self.linear_fast(attn_out, *aw.o_w, *aw.o_s, aw.o_b);
+                            out_kv.push_back(ck);
+                            out_kv.push_back(cv);
+                            kv_idx += 2;
+                            break;
+                        }
+                        case BlockType::MLP: {
+                            auto& mw = *self.mlp_layer_weights_[i];
+                            auto normed = self.rms_norm(h, *mw.norm_w);
+                            auto up = self.linear_fast(normed, *mw.up_w, *mw.up_s, mw.up_b);
+                            block_out = self.linear_fast(
+                                relu2(up), *mw.down_w, *mw.down_s, mw.down_b);
+                            break;
+                        }
+                        case BlockType::MOE: {
+                            auto& mw = *self.moe_layer_weights_[i];
+                            auto normed = self.rms_norm(h, *mw.norm_w);
+                            block_out = self.moe_block(normed, i);
+                            break;
+                        }
+                    }
+
+                    h = mx::add(h, *block_out);
+                }
+
+                auto norm_f_w = self.get_weight("norm_f.weight");
+                h = self.rms_norm(h, norm_f_w);
+                auto logits = self.lm_head_proj(h);
+
+                // Pack: [logits, kv_0_k, kv_0_v, ..., conv_0, ..., ssm_0, ...]
+                std::vector<mx::array> outputs;
+                outputs.push_back(logits);
+                for (auto& kv : out_kv) outputs.push_back(kv);
+                for (auto& c : out_conv) outputs.push_back(c);
+                for (auto& s : out_ssm) outputs.push_back(s);
+                return outputs;
+            };
+
+        compiled_step_ = mx::compile(step_fn, /*shapeless=*/false);
+        compiled_step_initialized_ = true;
+        std::cout << "[NemotronH] Full forward compiled with array-indexed KV cache" << std::endl;
+    }
+
+    // Pack all state into input vector
+    std::vector<mx::array> inputs;
+    inputs.push_back(input_ids);
+    inputs.push_back(mx::array({cache_offset}, mx::int32));
+    for (size_t i = 0; i < cache_keys.size(); i++) {
+        inputs.push_back(cache_keys[i]);
+        inputs.push_back(cache_values[i]);
+    }
+    for (auto& c : mamba_conv_states_) inputs.push_back(c);
+    for (auto& s : mamba_ssm_states_) inputs.push_back(s);
+
+    // Build attention mask: positions 0..cache_offset are valid (0.0), rest are -inf
+    int max_ctx = cache_keys[0].shape(2);
+    auto positions = mx::arange(0, max_ctx, mx::int32);
+    auto offset_arr = mx::array({cache_offset}, mx::int32);
+    auto mask = mx::where(
+        mx::less_equal(positions, offset_arr),
+        mx::array(0.0f, mx::float32),
+        mx::array(-1e9f, mx::float32));
+    inputs.push_back(mx::reshape(mask, {1, 1, 1, max_ctx}));
+
+    // Run compiled forward
+    auto results = compiled_step_(inputs);
+
+    // Unpack outputs
+    auto logits = results[0];
+    int ridx = 1;
+    for (size_t i = 0; i < cache_keys.size(); i++) {
+        cache_keys[i] = results[ridx++];
+        cache_values[i] = results[ridx++];
+    }
+    for (size_t i = 0; i < mamba_conv_states_.size(); i++) {
+        mamba_conv_states_[i] = results[ridx++];
+    }
+    for (size_t i = 0; i < mamba_ssm_states_.size(); i++) {
+        mamba_ssm_states_[i] = results[ridx++];
+    }
+
+    return logits;
+}
+
+// ---------------------------------------------------------------------------
 // Mamba state initialization
 // ---------------------------------------------------------------------------
 
@@ -953,10 +1522,16 @@ mx::array NemotronHModel::forward(
     int cache_offset) {
 
     int B_dim = input_ids.shape(0);
+    int L = input_ids.shape(1);
 
     // Initialize mamba states if needed
     if (!mamba_states_initialized_) {
         init_mamba_states(B_dim);
+    }
+
+    // For single-token decode, use functional forward (no per-layer eval, full graph)
+    if (L == 1) {
+        return compiled_decode(input_ids, cache_keys, cache_values, cache_offset);
     }
 
     auto h = embed(input_ids);
