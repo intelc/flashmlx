@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <iostream>
+#include <fstream>
 #include <chrono>
 
 namespace py = pybind11;
@@ -10,7 +11,30 @@ namespace flashmlx {
 
 Engine::Engine(const std::string& model_path, int max_batch_size, int max_context_len)
     : model_path_(model_path), max_batch_size_(max_batch_size), max_context_len_(max_context_len) {
-    // Load model
+    // Detect model_type from config.json (default to llama-family)
+    std::string model_type = "llama";
+    {
+        std::ifstream cfg_file(model_path + "/config.json");
+        if (cfg_file.is_open()) {
+            std::string line;
+            while (std::getline(cfg_file, line)) {
+                auto pos = line.find("\"model_type\"");
+                if (pos != std::string::npos) {
+                    auto colon = line.find(':', pos);
+                    auto q1 = line.find('"', colon + 1);
+                    auto q2 = line.find('"', q1 + 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos) {
+                        model_type = line.substr(q1 + 1, q2 - q1 - 1);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    std::cout << "[Engine] Detected model_type: " << model_type << std::endl;
+
+    // Instantiate the appropriate model backend
+    // Future: if (model_type == "nemotron_h") model_ = std::make_unique<NemotronHModel>(model_path);
     model_ = std::make_unique<LlamaModel>(model_path);
 
     // Create KV cache pool using model config

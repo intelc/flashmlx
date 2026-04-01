@@ -35,7 +35,7 @@ struct Request {
 
 class BatchScheduler {
 public:
-    BatchScheduler(LlamaModel& model, KVCachePool& pool);
+    BatchScheduler(ModelBase& model, KVCachePool& pool);
 
     /// Thread-safe: enqueue a new request
     void submit(Request req);
@@ -61,7 +61,7 @@ private:
                       std::vector<std::string>& done_ids);
 
 
-    LlamaModel& model_;
+    ModelBase& model_;
     KVCachePool& pool_;
 
     // Pending queue — accessed from submit() (Python thread) and step() (C++ thread)

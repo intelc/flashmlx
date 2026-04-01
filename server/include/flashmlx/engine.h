@@ -43,7 +43,7 @@ public:
     std::vector<float> debug_embed(const std::vector<int>& token_ids);
 
 private:
-    std::unique_ptr<LlamaModel> model_;
+    std::unique_ptr<ModelBase> model_;
     std::unique_ptr<KVCachePool> kv_pool_;
     std::unique_ptr<BatchScheduler> scheduler_;
     std::string model_path_;

@@ -5,7 +5,7 @@
 
 namespace flashmlx {
 
-BatchScheduler::BatchScheduler(LlamaModel& model, KVCachePool& pool)
+BatchScheduler::BatchScheduler(ModelBase& model, KVCachePool& pool)
     : model_(model), pool_(pool) {}
 
 void BatchScheduler::submit(Request req) {

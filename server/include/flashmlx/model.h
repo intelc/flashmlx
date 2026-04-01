@@ -57,7 +57,29 @@ struct MoEWeights {
     bool shared_expert_gate_quantized = false;
 };
 
-class LlamaModel {
+/// Abstract base for all model architectures (LLaMA, Nemotron-H, etc.)
+class ModelBase {
+public:
+    virtual ~ModelBase() = default;
+
+    virtual mx::array forward(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        int cache_offset) = 0;
+
+    virtual mx::array forward(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        const mx::array& cache_offsets) = 0;
+
+    virtual const ModelConfig& config() const = 0;
+    virtual std::vector<int> debug_forward(const std::vector<int>& token_ids) = 0;
+    virtual std::vector<float> debug_embed(const std::vector<int>& token_ids) = 0;
+};
+
+class LlamaModel : public ModelBase {
 public:
     explicit LlamaModel(const std::string& model_path);
 
@@ -66,22 +88,22 @@ public:
         const mx::array& input_ids,
         std::vector<mx::array>& cache_keys,
         std::vector<mx::array>& cache_values,
-        const mx::array& cache_offsets);
+        const mx::array& cache_offsets) override;
 
     /// Overload with integer offset (avoids mx::eval sync for homogeneous batching)
     mx::array forward(
         const mx::array& input_ids,
         std::vector<mx::array>& cache_keys,
         std::vector<mx::array>& cache_values,
-        int cache_offset);
+        int cache_offset) override;
 
-    const ModelConfig& config() const { return config_; }
+    const ModelConfig& config() const override { return config_; }
 
     /// Debug: run forward pass and return top-5 token IDs from last position
-    std::vector<int> debug_forward(const std::vector<int>& token_ids);
+    std::vector<int> debug_forward(const std::vector<int>& token_ids) override;
 
     /// Debug: return embedding for given token IDs as flat float vector
-    std::vector<float> debug_embed(const std::vector<int>& token_ids);
+    std::vector<float> debug_embed(const std::vector<int>& token_ids) override;
 
 private:
     void load_config(const std::string& model_path);
