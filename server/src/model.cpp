@@ -175,6 +175,8 @@ LlamaModel::LlamaModel(const std::string& model_path) {
               << std::endl;
     load_weights(model_path);
 
+    build_weight_cache();
+
     // Pre-dequantize embedding for fast lookup (avoids per-call dequantize)
     if (has_weight("embed_tokens.scales")) {
         auto w = get_weight("embed_tokens.weight");
@@ -203,6 +205,105 @@ mx::array LlamaModel::get_weight(const std::string& name) const {
 
 bool LlamaModel::has_weight(const std::string& name) const {
     return weights_.find(name) != weights_.end();
+}
+
+// ---------------------------------------------------------------------------
+// Weight cache
+// ---------------------------------------------------------------------------
+
+void LlamaModel::build_weight_cache() {
+    layer_weights_.reserve(config_.num_hidden_layers);
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        std::string p = "layers." + std::to_string(i);
+        auto attn  = p + ".self_attn";
+        auto mlp_p = p + ".mlp";
+
+        // Build norms + attention weights
+        mx::array input_norm_w  = get_weight(p + ".input_layernorm.weight");
+        mx::array post_norm_w   = get_weight(p + ".post_attention_layernorm.weight");
+
+        mx::array q_w = get_weight(attn + ".q_proj.weight");
+        mx::array q_s = get_weight(attn + ".q_proj.scales");
+        std::optional<mx::array> q_b = has_weight(attn + ".q_proj.biases") ?
+            std::optional<mx::array>(get_weight(attn + ".q_proj.biases")) : std::nullopt;
+
+        mx::array k_w = get_weight(attn + ".k_proj.weight");
+        mx::array k_s = get_weight(attn + ".k_proj.scales");
+        std::optional<mx::array> k_b = has_weight(attn + ".k_proj.biases") ?
+            std::optional<mx::array>(get_weight(attn + ".k_proj.biases")) : std::nullopt;
+
+        mx::array v_w = get_weight(attn + ".v_proj.weight");
+        mx::array v_s = get_weight(attn + ".v_proj.scales");
+        std::optional<mx::array> v_b = has_weight(attn + ".v_proj.biases") ?
+            std::optional<mx::array>(get_weight(attn + ".v_proj.biases")) : std::nullopt;
+
+        mx::array o_w = get_weight(attn + ".o_proj.weight");
+        mx::array o_s = get_weight(attn + ".o_proj.scales");
+        std::optional<mx::array> o_b = has_weight(attn + ".o_proj.biases") ?
+            std::optional<mx::array>(get_weight(attn + ".o_proj.biases")) : std::nullopt;
+
+        bool has_q_norm = has_weight(attn + ".q_norm.weight");
+
+        mx::array gate_w = get_weight(mlp_p + ".gate_proj.weight");
+        mx::array gate_s = get_weight(mlp_p + ".gate_proj.scales");
+        std::optional<mx::array> gate_b = has_weight(mlp_p + ".gate_proj.biases") ?
+            std::optional<mx::array>(get_weight(mlp_p + ".gate_proj.biases")) : std::nullopt;
+
+        mx::array up_w = get_weight(mlp_p + ".up_proj.weight");
+        mx::array up_s = get_weight(mlp_p + ".up_proj.scales");
+        std::optional<mx::array> up_b = has_weight(mlp_p + ".up_proj.biases") ?
+            std::optional<mx::array>(get_weight(mlp_p + ".up_proj.biases")) : std::nullopt;
+
+        mx::array down_w = get_weight(mlp_p + ".down_proj.weight");
+        mx::array down_s = get_weight(mlp_p + ".down_proj.scales");
+        std::optional<mx::array> down_b = has_weight(mlp_p + ".down_proj.biases") ?
+            std::optional<mx::array>(get_weight(mlp_p + ".down_proj.biases")) : std::nullopt;
+
+        if (has_q_norm) {
+            mx::array q_norm_w = get_weight(attn + ".q_norm.weight");
+            mx::array k_norm_w = get_weight(attn + ".k_norm.weight");
+            layer_weights_.push_back(LayerWeights{
+                std::move(q_w), std::move(q_s), std::move(k_w), std::move(k_s),
+                std::move(v_w), std::move(v_s), std::move(o_w), std::move(o_s),
+                std::move(q_b), std::move(k_b), std::move(v_b), std::move(o_b),
+                std::move(input_norm_w), std::move(post_norm_w),
+                /*has_q_norm=*/true, std::move(q_norm_w), std::move(k_norm_w),
+                std::move(gate_w), std::move(gate_s),
+                std::move(up_w), std::move(up_s),
+                std::move(down_w), std::move(down_s),
+                std::move(gate_b), std::move(up_b), std::move(down_b)
+            });
+        } else {
+            // Provide placeholder arrays for q_norm_w, k_norm_w — they won't be used
+            mx::array dummy = get_weight(p + ".input_layernorm.weight");  // re-use any valid array
+            layer_weights_.push_back(LayerWeights{
+                std::move(q_w), std::move(q_s), std::move(k_w), std::move(k_s),
+                std::move(v_w), std::move(v_s), std::move(o_w), std::move(o_s),
+                std::move(q_b), std::move(k_b), std::move(v_b), std::move(o_b),
+                std::move(input_norm_w), std::move(post_norm_w),
+                /*has_q_norm=*/false, dummy, dummy,
+                std::move(gate_w), std::move(gate_s),
+                std::move(up_w), std::move(up_s),
+                std::move(down_w), std::move(down_s),
+                std::move(gate_b), std::move(up_b), std::move(down_b)
+            });
+        }
+    }
+
+    // Cache final norm weight
+    norm_w_ = get_weight("norm.weight");
+
+    std::cout << "[flashmlx] Built weight cache for " << config_.num_hidden_layers << " layers" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Fast linear (uses pre-resolved weight references — no hash lookup)
+// ---------------------------------------------------------------------------
+
+mx::array LlamaModel::linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,
+                                   const std::optional<mx::array>& b) {
+    return mx::quantized_matmul(x, w, s, b, /*transpose=*/true,
+                                config_.quant_group_size, config_.quant_bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +473,18 @@ mx::array LlamaModel::mlp(const mx::array& x, int layer) {
     return linear(activated, prefix + ".down_proj");
 }
 
+mx::array LlamaModel::mlp_fast(const mx::array& x, int layer) {
+    const auto& lw = layer_weights_[layer];
+
+    auto gate = linear_fast(x, lw.gate_w, lw.gate_s, lw.gate_b);
+    auto up   = linear_fast(x, lw.up_w,   lw.up_s,   lw.up_b);
+
+    // SiLU(gate) * up
+    auto activated = mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), up);
+
+    return linear_fast(activated, lw.down_w, lw.down_s, lw.down_b);
+}
+
 mx::array LlamaModel::transformer_block(
     const mx::array& x, int layer,
     mx::array& cache_k, mx::array& cache_v,
@@ -401,26 +514,26 @@ mx::array LlamaModel::attention(
     mx::array& cache_k, mx::array& cache_v,
     int cache_offset) {
 
-    std::string prefix = "layers." + std::to_string(layer) + ".self_attn";
+    const auto& lw = layer_weights_[layer];
     int B = x.shape(0);
     int L = x.shape(1);
     int n_heads = config_.num_attention_heads;
     int n_kv_heads = config_.num_key_value_heads;
     int hd = head_dim_;
 
-    auto q = linear(x, prefix + ".q_proj");
-    auto k = linear(x, prefix + ".k_proj");
-    auto v = linear(x, prefix + ".v_proj");
+    auto q = linear_fast(x, lw.q_w, lw.q_s, lw.q_b);
+    auto k = linear_fast(x, lw.k_w, lw.k_s, lw.k_b);
+    auto v = linear_fast(x, lw.v_w, lw.v_s, lw.v_b);
 
     q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
     k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
     v = mx::transpose(mx::reshape(v, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
 
-    // QK-norm (Qwen3)
-    std::string q_norm_key = prefix + ".q_norm.weight";
-    std::string k_norm_key = prefix + ".k_norm.weight";
-    if (has_weight(q_norm_key)) q = rms_norm(q, get_weight(q_norm_key));
-    if (has_weight(k_norm_key)) k = rms_norm(k, get_weight(k_norm_key));
+    // QK-norm (Qwen3) — use cached weight flags
+    if (lw.has_q_norm) {
+        q = rms_norm(q, lw.q_norm_w);
+        k = rms_norm(k, lw.k_norm_w);
+    }
 
     // RoPE with integer offset — creates the offset array lazily
     auto offset_arr = mx::array({cache_offset}, mx::int32);
@@ -440,7 +553,7 @@ mx::array LlamaModel::attention(
     std::string mask_mode = (L > 1) ? "causal" : "";
     auto attn_out = mx::fast::scaled_dot_product_attention(q, full_k, full_v, scale, mask_mode);
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
-    return linear(attn_out, prefix + ".o_proj");
+    return linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b);
 }
 
 mx::array LlamaModel::transformer_block(
@@ -448,12 +561,12 @@ mx::array LlamaModel::transformer_block(
     mx::array& cache_k, mx::array& cache_v,
     int cache_offset) {
 
-    std::string prefix = "layers." + std::to_string(layer);
-    auto normed = rms_norm(x, get_weight(prefix + ".input_layernorm.weight"));
+    const auto& lw = layer_weights_[layer];
+    auto normed = rms_norm(x, lw.input_norm_w);
     auto attn_out = attention(normed, layer, cache_k, cache_v, cache_offset);
     auto h = mx::add(x, attn_out);
-    auto normed2 = rms_norm(h, get_weight(prefix + ".post_attention_layernorm.weight"));
-    auto mlp_out = mlp(normed2, layer);
+    auto normed2 = rms_norm(h, lw.post_norm_w);
+    auto mlp_out = mlp_fast(normed2, layer);
     return mx::add(h, mlp_out);
 }
 
@@ -467,7 +580,7 @@ mx::array LlamaModel::forward(
     for (int i = 0; i < config_.num_hidden_layers; i++) {
         h = transformer_block(h, i, cache_keys[i], cache_values[i], cache_offset);
     }
-    h = rms_norm(h, get_weight("norm.weight"));
+    h = rms_norm(h, *norm_w_);
     return lm_head(h);
 }
 

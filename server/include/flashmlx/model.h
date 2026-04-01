@@ -81,6 +81,11 @@ private:
         mx::array& cache_k, mx::array& cache_v,
         int cache_offset);
     mx::array mlp(const mx::array& x, int layer);
+    mx::array mlp_fast(const mx::array& x, int layer);
+
+    // Fast linear using pre-resolved weight references (no hash lookup)
+    mx::array linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,
+                          const std::optional<mx::array>& b);
 
     // Helpers
     mx::array get_weight(const std::string& name) const;
@@ -103,6 +108,7 @@ private:
         std::optional<mx::array> gate_b, up_b, down_b;
     };
     std::vector<LayerWeights> layer_weights_;
+    std::optional<mx::array> norm_w_;   // cached final norm weight
     void build_weight_cache();
 };
 
