@@ -89,6 +89,21 @@ private:
     ModelConfig config_;
     std::unordered_map<std::string, mx::array> weights_;
     int head_dim_ = 0;
+
+    // Pre-built weight reference cache for fast lookup
+    struct LayerWeights {
+        // Attention
+        mx::array q_w, q_s, k_w, k_s, v_w, v_s, o_w, o_s;
+        std::optional<mx::array> q_b, k_b, v_b, o_b;
+        mx::array input_norm_w, post_norm_w;
+        bool has_q_norm = false;
+        mx::array q_norm_w, k_norm_w;
+        // MLP
+        mx::array gate_w, gate_s, up_w, up_s, down_w, down_s;
+        std::optional<mx::array> gate_b, up_b, down_b;
+    };
+    std::vector<LayerWeights> layer_weights_;
+    void build_weight_cache();
 };
 
 } // namespace flashmlx
