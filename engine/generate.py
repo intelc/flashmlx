@@ -60,16 +60,30 @@ def generate(
     y = _sample(logits, temperature)
     mx.async_eval(y)
 
+    # Compile the decode step when using pre-allocated cache (fixed shapes)
+    if prealloc_cache:
+        @mx.compile
+        def _compiled_step(input_ids):
+            logits = model(input_ids, cache=cache)
+            return logits[:, -1, :]
+        # Warmup compilation
+        _compiled_step(y.reshape(1, 1))
+        mx.eval(y)
+        step_fn = _compiled_step
+    else:
+        def step_fn(input_ids):
+            logits = model(input_ids, cache=cache)
+            return logits[:, -1, :]
+
     if eval_batch_size <= 1:
-        # Simple per-token loop — optimal for large models
+        # Simple per-token loop
         for _ in range(max_tokens):
             yield y.item()
-            logits = model(y.reshape(1, 1), cache=cache)
-            logits = logits[:, -1, :]
+            logits = step_fn(y.reshape(1, 1))
             y = _sample(logits, temperature)
             mx.async_eval(y)
     else:
-        # N-step graph batching — optimal for small models
+        # N-step graph batching
         BATCH_STEPS = eval_batch_size
         generated = 0
         while generated < max_tokens:
@@ -82,8 +96,7 @@ def generate(
             tokens = []
             prev = y
             for _ in range(remaining):
-                logits = model(prev.reshape(1, 1), cache=cache)
-                logits = logits[:, -1, :]
+                logits = step_fn(prev.reshape(1, 1))
                 prev = _sample(logits, temperature)
                 tokens.append(prev)
 
