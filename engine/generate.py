@@ -28,6 +28,9 @@ def generate(
     if max_tokens == 0:
         return
 
+    # Set generous Metal cache to reduce allocation overhead
+    mx.metal.set_cache_limit(4 * 1024 * 1024 * 1024)  # 4GB
+
     cache = model.make_cache()
 
     # Prefill: process prompt in chunks
