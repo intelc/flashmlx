@@ -14,7 +14,7 @@ from engine.quantize import QuantConfig
 
 
 # Models that use the Llama architecture (GQA + SwiGLU + RMSNorm)
-LLAMA_FAMILY = {"llama", "mistral", "qwen2", "qwen2_moe", "gemma", "gemma2", "phi3", "cohere"}
+LLAMA_FAMILY = {"llama", "mistral", "qwen2", "qwen3", "qwen2_moe", "gemma", "gemma2", "phi3", "cohere"}
 
 
 def detect_architecture(config: dict) -> str:
