@@ -22,6 +22,7 @@ find_package(pybind11 REQUIRED)
 pybind11_add_module(_flashmlx_engine
     src/engine.cpp
     src/model.cpp
+    src/nemotron_h.cpp
     src/kv_pool.cpp
     src/sampling.cpp
     src/scheduler.cpp

@@ -34,15 +34,24 @@ Engine::Engine(const std::string& model_path, int max_batch_size, int max_contex
     std::cout << "[Engine] Detected model_type: " << model_type << std::endl;
 
     // Instantiate the appropriate model backend
-    // Future: if (model_type == "nemotron_h") model_ = std::make_unique<NemotronHModel>(model_path);
-    model_ = std::make_unique<LlamaModel>(model_path);
+    if (model_type == "nemotron_h") {
+        model_ = std::make_unique<NemotronHModel>(model_path);
+    } else {
+        model_ = std::make_unique<LlamaModel>(model_path);
+    }
 
     // Create KV cache pool using model config
     const auto& cfg = model_->config();
     int head_dim = cfg.head_dim > 0 ? cfg.head_dim : cfg.hidden_size / cfg.num_attention_heads;
+    // For NemotronH, only attention layers need KV cache
+    int kv_layers = cfg.num_hidden_layers;
+    if (model_type == "nemotron_h") {
+        auto* nemotron = dynamic_cast<NemotronHModel*>(model_.get());
+        if (nemotron) kv_layers = nemotron->num_attn_layers();
+    }
     kv_pool_ = std::make_unique<KVCachePool>(
         max_batch_size, max_context_len,
-        cfg.num_hidden_layers, cfg.num_key_value_heads, head_dim,
+        kv_layers, cfg.num_key_value_heads, head_dim,
         cfg.activation_dtype);
 
     // Create scheduler

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/fast.h>
 
 namespace mx = mlx::core;
 
@@ -173,6 +174,91 @@ private:
 
     void build_weight_cache();
     void build_moe_weight_cache();
+};
+
+// Forward-declare block type enum (defined in nemotron_h.cpp)
+enum class BlockType;
+
+class NemotronHModel : public ModelBase {
+public:
+    explicit NemotronHModel(const std::string& model_path);
+
+    mx::array forward(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        const mx::array& cache_offsets) override;
+
+    mx::array forward(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        int cache_offset) override;
+
+    const ModelConfig& config() const override { return config_; }
+    std::vector<int> debug_forward(const std::vector<int>& token_ids) override;
+    std::vector<float> debug_embed(const std::vector<int>& token_ids) override;
+
+    /// Number of attention layers (for KV cache allocation)
+    int num_attn_layers() const { return num_attn_layers_; }
+
+private:
+    void load_config(const std::string& model_path);
+    void load_weights(const std::string& model_path);
+    void parse_pattern();
+    void build_ssm_kernel();
+    void init_mamba_states(int batch_size);
+
+    // Building blocks
+    mx::array rms_norm(const mx::array& x, const mx::array& weight);
+    mx::array embed(const mx::array& input_ids);
+    mx::array lm_head_proj(const mx::array& x);
+    mx::array linear(const mx::array& x, const std::string& prefix);
+
+    mx::array mamba_block(const mx::array& x, int layer, int mamba_idx);
+    mx::array attention_block(const mx::array& x, int layer, int attn_idx,
+                              mx::array& cache_k, mx::array& cache_v, int cache_offset);
+    mx::array attention_block(const mx::array& x, int layer, int attn_idx,
+                              mx::array& cache_k, mx::array& cache_v,
+                              const mx::array& cache_offsets);
+    mx::array mlp_block(const mx::array& x, int layer);
+
+    mx::array get_weight(const std::string& name) const;
+    bool has_weight(const std::string& name) const;
+
+    ModelConfig config_;
+    std::unordered_map<std::string, mx::array> weights_;
+
+    // Nemotron-H specific config
+    int mamba_num_heads_ = 96;
+    int mamba_head_dim_ = 80;
+    int ssm_state_size_ = 128;
+    int conv_kernel_ = 4;
+    int n_groups_ = 8;
+    float time_step_min_ = 0.001f;
+    float time_step_max_ = 0.1f;
+    bool use_conv_bias_ = true;
+
+    // Derived dimensions
+    int d_inner_ = 0;       // mamba_num_heads * mamba_head_dim
+    int conv_dim_ = 0;      // d_inner + 2 * n_groups * ssm_state_size
+    int attn_head_dim_ = 0;
+
+    // Pattern
+    std::string hybrid_override_pattern_;
+    std::vector<BlockType> block_types_;
+    std::vector<int> attn_layer_indices_;   // layer -> attn cache index (-1 if not attn)
+    std::vector<int> mamba_layer_indices_;  // layer -> mamba state index (-1 if not mamba)
+    int num_attn_layers_ = 0;
+    int num_mamba_layers_ = 0;
+
+    // SSM Metal kernel
+    mx::fast::CustomKernelFunction ssm_kernel_;
+
+    // Mamba states (managed internally, not in KV pool)
+    std::vector<mx::array> mamba_conv_states_;   // one per Mamba block
+    std::vector<mx::array> mamba_ssm_states_;    // one per Mamba block
+    bool mamba_states_initialized_ = false;
 };
 
 } // namespace flashmlx
