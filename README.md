@@ -41,6 +41,15 @@ FlashMLX matches its Python engine and beats ollama by 28% on Qwen3-8B.
 
 At 8B with non-quantized embeddings, the C++ server has higher graph overhead. Scales to match Python at C=4.
 
+### Qwen1.5-MoE-A2.7B — MoE Server Throughput (tok/s)
+
+| Engine | C=1 | C=4 |
+|--------|----:|----:|
+| **FlashMLX C++ Server** | **103** | **135** |
+| mlx-lm (sequential) | 106 | — |
+
+First MoE model supported! 60 experts, top-4 routing, 2.7B active parameters. FlashMLX uses `mx::gather_qmm` for efficient indexed expert execution.
+
 ### Key Optimizations
 
 **Python Engine:**

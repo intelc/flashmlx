@@ -44,6 +44,28 @@ Different model sizes have different bottlenecks and optimal configurations.
 - Concat KV helps marginally at 8B (21.3ms vs 22.1ms)
 - The 6ms gap may require mx::compile in C++ or architectural changes
 
+## MoE Models — e.g., Qwen1.5-MoE-A2.7B (60 experts, top-4)
+
+**Bottleneck:** Expert routing + gather_qmm dispatch overhead
+**Architecture:** Standard attention + MoE-MLP (router selects top-k experts per token)
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| Expert execution | `mx::gather_qmm` | Indexed quantized matmul across expert weights |
+| Expert stacking | `mx::stack` at load | Stack 60 expert weights into `[60, ...]` tensors |
+| Router | softmax + argpartition top-k | Non-quantized linear → softmax → top-4 selection |
+| Shared expert | Always active, sigmoid-gated | Separate SwiGLU MLP + sigmoid gate |
+| Sorted indices | Yes (when ≥64 tokens) | argsort indices for gather_qmm cache locality |
+| KV cache | Same as dense | MoE only replaces MLP, attention unchanged |
+
+**C++ server results:** 103 tok/s C=1, 135 tok/s C=4
+**mlx-lm baseline:** 106 tok/s sequential
+
+### Supported MoE Model Types
+- `qwen2_moe` (Qwen1.5-MoE, Qwen2-MoE)
+- `qwen3_moe` (Qwen3-30B-A3B)
+- `granitemoe`, `deepseek`, `phimoe` (untested but same pattern)
+
 ### Why Qwen3-8B is faster than Llama-3-8B on FlashMLX
 - Qwen3's quantized embedding → pre-dequant optimization applies (+70% on embed)
 - Llama-3's float16 embedding → no pre-dequant benefit
