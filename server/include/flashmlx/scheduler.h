@@ -60,6 +60,7 @@ private:
                       std::unordered_map<std::string, std::vector<int>>& new_tokens,
                       std::vector<std::string>& done_ids);
 
+
     LlamaModel& model_;
     KVCachePool& pool_;
 

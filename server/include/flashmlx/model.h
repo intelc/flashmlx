@@ -40,6 +40,13 @@ public:
         std::vector<mx::array>& cache_values,
         const mx::array& cache_offsets);
 
+    /// Overload with integer offset (avoids mx::eval sync for homogeneous batching)
+    mx::array forward(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        int cache_offset);
+
     const ModelConfig& config() const { return config_; }
 
     /// Debug: run forward pass and return top-5 token IDs from last position
@@ -61,10 +68,18 @@ private:
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
         const mx::array& cache_offsets);
+    mx::array transformer_block(
+        const mx::array& x, int layer,
+        mx::array& cache_k, mx::array& cache_v,
+        int cache_offset);
     mx::array attention(
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
         const mx::array& cache_offsets);
+    mx::array attention(
+        const mx::array& x, int layer,
+        mx::array& cache_k, mx::array& cache_v,
+        int cache_offset);
     mx::array mlp(const mx::array& x, int layer);
 
     // Helpers

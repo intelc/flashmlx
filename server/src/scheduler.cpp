@@ -52,10 +52,14 @@ std::unordered_map<std::string, std::vector<int>> BatchScheduler::step() {
 
         for (auto& [offset, group_ids] : offset_groups) {
             if (group_ids.size() == 1) {
-                // Single request — use existing path
+                // Single request — N-step graph batching
                 auto& req = active_[group_ids[0]];
+                int prev_count = req.generated_count;
                 decode_request(req);
-                new_tokens[group_ids[0]].push_back(req.output_tokens.back());
+                // Return all newly generated tokens
+                for (int i = prev_count; i < req.generated_count; i++) {
+                    new_tokens[group_ids[0]].push_back(req.output_tokens[i]);
+                }
                 if (req.generated_count >= req.max_tokens) {
                     req.state = RequestState::DONE;
                     done_ids.push_back(group_ids[0]);
@@ -162,42 +166,54 @@ void BatchScheduler::decode_request(Request& req) {
     int slot = req.kv_slot;
     int num_layers = model_.config().num_hidden_layers;
 
-    // Build input_ids [1, 1] from next_token
-    int tok_id = req.next_token.item<int>();
-    auto input_ids = mx::array(&tok_id, {1, 1}, mx::int32);
+    // N-step graph batching: build N forward passes before eval
+    // This matches the Python engine's key optimization
+    int N = std::min(16, req.max_tokens - req.generated_count);
 
-    // Gather cache arrays for this slot
-    std::vector<mx::array> cache_keys;
-    std::vector<mx::array> cache_values;
-    cache_keys.reserve(num_layers);
-    cache_values.reserve(num_layers);
-    for (int l = 0; l < num_layers; ++l) {
-        cache_keys.push_back(pool_.keys(slot, l));
-        cache_values.push_back(pool_.values(slot, l));
+    std::vector<mx::array> step_tokens;
+    mx::array prev_token = req.next_token;
+
+    for (int s = 0; s < N; s++) {
+        // Build input_ids [1, 1] — use prev_token directly (lazy, no eval needed)
+        auto input_ids = mx::reshape(prev_token, {1, 1});
+
+        // Gather cache arrays for this slot
+        std::vector<mx::array> cache_keys;
+        std::vector<mx::array> cache_values;
+        cache_keys.reserve(num_layers);
+        cache_values.reserve(num_layers);
+        for (int l = 0; l < num_layers; ++l) {
+            cache_keys.push_back(pool_.keys(slot, l));
+            cache_values.push_back(pool_.values(slot, l));
+        }
+
+        // Forward pass with int offset (no mx::eval sync!)
+        mx::array logits = model_.forward(input_ids, cache_keys, cache_values, req.cache_offset + s);
+
+        // Write updated caches back to pool
+        for (int l = 0; l < num_layers; ++l) {
+            pool_.keys(slot, l) = cache_keys[l];
+            pool_.values(slot, l) = cache_values[l];
+        }
+
+        // Sample (lazy)
+        mx::array last_logits = mx::reshape(logits, {1, -1});
+        mx::array token = sample_token(last_logits, req.temperature);
+        step_tokens.push_back(token);
+        prev_token = token;
     }
 
-    // Cache offset = current position
-    auto cache_offsets = mx::array({req.cache_offset}, mx::int32);
+    // Async eval all N tokens — overlap GPU compute with C++ bookkeeping
+    mx::async_eval(step_tokens);
 
-    // Forward pass
-    mx::array logits = model_.forward(input_ids, cache_keys, cache_values, cache_offsets);
-
-    // Write updated caches back to pool
-    for (int l = 0; l < num_layers; ++l) {
-        pool_.keys(slot, l) = cache_keys[l];
-        pool_.values(slot, l) = cache_values[l];
+    // Extract token IDs and update request state
+    for (auto& tok : step_tokens) {
+        int tok_id = tok.item<int>();
+        req.output_tokens.push_back(tok_id);
+        req.generated_count++;
+        req.cache_offset++;
     }
-
-    // Sample next token — logits shape [1, 1, vocab_size]
-    mx::array last_logits = mx::reshape(logits, {1, -1});
-    mx::array token = sample_token(last_logits, req.temperature);
-    mx::eval({token});
-    int new_tok_id = token.item<int>();
-
-    req.next_token = token;
-    req.output_tokens.push_back(new_tok_id);
-    req.generated_count++;
-    req.cache_offset++;
+    req.next_token = step_tokens.back();
 }
 
 void BatchScheduler::decode_batch(

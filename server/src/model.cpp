@@ -381,8 +381,85 @@ mx::array LlamaModel::transformer_block(
     return mx::add(h, mlp_out);
 }
 
+// Int-offset overloads (no mx::eval sync — critical for N-step batching)
+
+mx::array LlamaModel::attention(
+    const mx::array& x, int layer,
+    mx::array& cache_k, mx::array& cache_v,
+    int cache_offset) {
+
+    std::string prefix = "layers." + std::to_string(layer) + ".self_attn";
+    int B = x.shape(0);
+    int L = x.shape(1);
+    int n_heads = config_.num_attention_heads;
+    int n_kv_heads = config_.num_key_value_heads;
+    int hd = head_dim_;
+
+    auto q = linear(x, prefix + ".q_proj");
+    auto k = linear(x, prefix + ".k_proj");
+    auto v = linear(x, prefix + ".v_proj");
+
+    q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
+    k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
+    v = mx::transpose(mx::reshape(v, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
+
+    // QK-norm (Qwen3)
+    std::string q_norm_key = prefix + ".q_norm.weight";
+    std::string k_norm_key = prefix + ".k_norm.weight";
+    if (has_weight(q_norm_key)) q = rms_norm(q, get_weight(q_norm_key));
+    if (has_weight(k_norm_key)) k = rms_norm(k, get_weight(k_norm_key));
+
+    // RoPE with integer offset — creates the offset array lazily
+    auto offset_arr = mx::array({cache_offset}, mx::int32);
+    q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, offset_arr);
+    k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, offset_arr);
+
+    // KV cache update — no eval needed, use integer directly
+    int offset_val = cache_offset;
+    cache_k = mx::slice_update(cache_k, k, {0, 0, offset_val, 0}, {B, n_kv_heads, offset_val + L, hd});
+    cache_v = mx::slice_update(cache_v, v, {0, 0, offset_val, 0}, {B, n_kv_heads, offset_val + L, hd});
+
+    int total_len = offset_val + L;
+    auto full_k = mx::slice(cache_k, {0, 0, 0, 0}, {B, n_kv_heads, total_len, hd});
+    auto full_v = mx::slice(cache_v, {0, 0, 0, 0}, {B, n_kv_heads, total_len, hd});
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    std::string mask_mode = (L > 1) ? "causal" : "";
+    auto attn_out = mx::fast::scaled_dot_product_attention(q, full_k, full_v, scale, mask_mode);
+    attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
+    return linear(attn_out, prefix + ".o_proj");
+}
+
+mx::array LlamaModel::transformer_block(
+    const mx::array& x, int layer,
+    mx::array& cache_k, mx::array& cache_v,
+    int cache_offset) {
+
+    std::string prefix = "layers." + std::to_string(layer);
+    auto normed = rms_norm(x, get_weight(prefix + ".input_layernorm.weight"));
+    auto attn_out = attention(normed, layer, cache_k, cache_v, cache_offset);
+    auto h = mx::add(x, attn_out);
+    auto normed2 = rms_norm(h, get_weight(prefix + ".post_attention_layernorm.weight"));
+    auto mlp_out = mlp(normed2, layer);
+    return mx::add(h, mlp_out);
+}
+
+mx::array LlamaModel::forward(
+    const mx::array& input_ids,
+    std::vector<mx::array>& cache_keys,
+    std::vector<mx::array>& cache_values,
+    int cache_offset) {
+
+    auto h = embed(input_ids);
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        h = transformer_block(h, i, cache_keys[i], cache_values[i], cache_offset);
+    }
+    h = rms_norm(h, get_weight("norm.weight"));
+    return lm_head(h);
+}
+
 // ---------------------------------------------------------------------------
-// Forward pass
+// Forward pass (array-based offset — used for prefill and heterogeneous batching)
 // ---------------------------------------------------------------------------
 
 mx::array LlamaModel::forward(
