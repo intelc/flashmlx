@@ -30,8 +30,9 @@ def generate(
     if max_tokens == 0:
         return
 
-    # Set generous Metal cache to reduce allocation overhead
+    # Set generous Metal cache and wired limit to reduce allocation overhead
     mx.metal.set_cache_limit(4 * 1024 * 1024 * 1024)  # 4GB
+    mx.metal.set_wired_limit(4 * 1024 * 1024 * 1024)   # 4GB wired
 
     cache = model.make_cache()
 
