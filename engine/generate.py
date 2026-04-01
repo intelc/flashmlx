@@ -42,9 +42,15 @@ def generate(
     prompt_len = prompt.shape[1]
 
     if prompt_len <= prefill_chunk_size:
-        # Small prompt — single forward pass
-        logits = model(prompt, cache=cache)
-        logits = logits[:, -1, :]  # [1, vocab_size]
+        # Small prompt — single forward pass (compiled for prealloc cache)
+        if prealloc_cache:
+            @mx.compile
+            def _prefill(ids):
+                return model(ids, cache=cache)[:, -1, :]
+            logits = _prefill(prompt)
+        else:
+            logits = model(prompt, cache=cache)
+            logits = logits[:, -1, :]  # [1, vocab_size]
     else:
         # Large prompt — chunked prefill
         processed = 0
@@ -107,6 +113,23 @@ def generate(
                 generated += 1
 
             y = tokens[-1]
+
+
+def generate_all(
+    model,
+    prompt: mx.array,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+    prefill_chunk_size: int = 2048,
+    eval_batch_size: int = 16,
+    prealloc_cache: bool = False,
+) -> list[int]:
+    """Generate tokens and return as a list. Faster than generate() for batch use."""
+    return list(generate(
+        model, prompt, max_tokens=max_tokens, temperature=temperature,
+        prefill_chunk_size=prefill_chunk_size, eval_batch_size=eval_batch_size,
+        prealloc_cache=prealloc_cache,
+    ))
 
 
 def _sample(logits: mx.array, temperature: float) -> mx.array:
