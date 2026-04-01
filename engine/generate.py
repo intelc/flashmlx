@@ -39,7 +39,6 @@ def generate(
         chunk_size = min(prefill_chunk_size, prompt_len - processed - 1)
         chunk = prompt[:, processed : processed + chunk_size]
         model(chunk, cache=cache)
-        mx.eval([c.state for c in cache])
         processed += chunk_size
 
     # Process last token(s) of prompt to get first logits
