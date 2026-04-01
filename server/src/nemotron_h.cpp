@@ -914,11 +914,7 @@ mx::array NemotronHModel::forward(
 
         h = mx::add(h, block_out);
 
-        // Eval mamba states to prevent graph explosion
-        if (block_types_[i] == BlockType::Mamba) {
-            int mi = mamba_layer_indices_[i];
-            mx::eval({h, mamba_conv_states_[mi], mamba_ssm_states_[mi]});
-        }
+        // Mamba states are updated lazily — no per-block eval needed
     }
 
     // Final norm
