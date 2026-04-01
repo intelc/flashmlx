@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from engine.attention import scaled_dot_product_attention, create_causal_mask
+from engine.attention import create_causal_mask
 from engine.kv_cache import KVCache
 from engine.quantize import QuantConfig
 
@@ -100,7 +100,7 @@ class Attention(nn.Module):
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
 
-        out = scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
 
