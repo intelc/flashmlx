@@ -62,6 +62,31 @@ print()
 "
 ```
 
+## Inference Server
+
+FlashMLX includes a C++ inference server with an OpenAI-compatible API:
+
+```bash
+# Build the C++ extension
+cd server && mkdir -p build && cd build
+cmake .. && make -j$(sysctl -n hw.ncpu)
+cp _flashmlx_engine*.so ../python/
+cd ../..
+
+# Start the server
+python -m server.run mlx-community/Qwen3-0.6B-4bit --port 8080
+
+# Query it
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":50,"stream":true}'
+
+# Benchmark
+python server/bench_server.py --url http://localhost:8080/v1/chat/completions
+```
+
+The server uses a C++ engine (pybind11) with MLX's C++ API for model loading and inference. The generation loop runs on a dedicated C++ thread with no Python GIL involvement.
+
 ## Architecture
 
 ```

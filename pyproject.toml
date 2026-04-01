@@ -17,6 +17,12 @@ dev = [
     "pytest-timeout>=2.2",
 ]
 
+server = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.24.0",
+    "sse-starlette>=1.6.0",
+]
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
