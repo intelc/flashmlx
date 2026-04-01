@@ -212,10 +212,17 @@ def load_model(
     # Sanitize weight keys
     weights = model.sanitize(weights)
 
-    # Apply quantization if model is quantized
+    # Apply quantization if model is quantized (skip embeddings)
     quant = QuantConfig.from_model_config(config)
     if quant is not None:
-        nn.quantize(model, group_size=quant.group_size, bits=quant.bits)
+        nn.quantize(
+            model,
+            group_size=quant.group_size,
+            bits=quant.bits,
+            class_predicate=lambda _, m: (
+                hasattr(m, "to_quantized") and not isinstance(m, nn.Embedding)
+            ),
+        )
 
     # Load weights into model
     model.load_weights(list(weights.items()), strict=False)
