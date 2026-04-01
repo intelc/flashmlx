@@ -22,6 +22,7 @@ find_package(pybind11 REQUIRED)
 pybind11_add_module(_flashmlx_engine
     src/engine.cpp
     src/model.cpp
+    src/kv_pool.cpp
 )
 target_include_directories(_flashmlx_engine PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
