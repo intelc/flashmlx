@@ -72,7 +72,10 @@ def generate(
         for _ in range(remaining):
             logits = model(prev.reshape(1, 1), cache=cache)
             logits = logits[:, -1, :]
-            prev = _sample(logits, temperature)
+            if temperature <= 0.0:
+                prev = mx.argmax(logits, axis=-1)
+            else:
+                prev = mx.random.categorical(logits * (1.0 / temperature))
             tokens.append(prev)
 
         # Eval all tokens at once
