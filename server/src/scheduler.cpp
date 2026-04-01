@@ -172,7 +172,8 @@ void BatchScheduler::decode_request(Request& req) {
     int num_layers = pool_.num_layers();
 
     // N-step graph batching: build N forward passes before eval
-    int N = std::min(32, req.max_tokens - req.generated_count);
+    int batch_n = (model_.config().num_hidden_layers > 40) ? 64 : 32;
+    int N = std::min(batch_n, req.max_tokens - req.generated_count);
 
     std::vector<mx::array> step_tokens;
     mx::array prev_token = req.next_token;
