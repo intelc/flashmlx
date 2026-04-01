@@ -778,25 +778,30 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
     int B_dim = x.shape(0);
     int L = x.shape(1);
 
-    // 1. Router
+    // 1. Router — uses sigmoid scoring (NOT softmax) matching mlx-lm
     auto gate_w = get_weight(prefix + "gate.weight");
     auto logits = mx::matmul(x, mx::transpose(gate_w, {1, 0}));
+    // Sigmoid scoring for original scores
+    auto orig_scores = mx::sigmoid(mx::astype(logits, mx::float32));
+    // Add correction bias for expert selection (separate from orig_scores)
+    auto selection_scores = orig_scores;
     if (has_weight(prefix + "gate.e_score_correction_bias")) {
-        logits = mx::add(logits, get_weight(prefix + "gate.e_score_correction_bias"));
+        selection_scores = mx::add(selection_scores, get_weight(prefix + "gate.e_score_correction_bias"));
     }
-    auto scores = mx::softmax(logits, -1);
 
-    // 2. Top-k selection (simplified V1 — skip group selection)
-    auto neg = mx::negative(scores);
+    // 2. Top-k selection from selection_scores, but use orig_scores for weighting
+    auto neg = mx::negative(selection_scores);
     auto topk_inds = mx::argpartition(neg, k - 1, -1);
     topk_inds = mx::slice(topk_inds, {0, 0, 0}, {B_dim, L, k});
-    auto topk_scores = mx::take_along_axis(scores, topk_inds, -1);
+    // Routing weights come from orig_scores (before correction bias)
+    auto topk_scores = mx::take_along_axis(orig_scores, topk_inds, -1);
 
-    // Scale
-    topk_scores = mx::multiply(topk_scores, mx::array(config_.routed_scaling_factor));
-    if (config_.norm_topk_prob) {
-        topk_scores = mx::divide(topk_scores, mx::sum(topk_scores, -1, true));
+    // Normalize and scale
+    if (config_.norm_topk_prob && k > 1) {
+        auto denom = mx::add(mx::sum(topk_scores, -1, true), mx::array(1e-20f));
+        topk_scores = mx::divide(topk_scores, denom);
     }
+    topk_scores = mx::multiply(topk_scores, mx::array(config_.routed_scaling_factor));
 
     // 3. SwitchMLP: fc1 -> relu^2 -> fc2 (via gather_qmm)
     auto x_exp = mx::expand_dims(x, {-2, -3});  // [B, L, 1, 1, hidden]
