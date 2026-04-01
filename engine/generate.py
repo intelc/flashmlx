@@ -30,21 +30,25 @@ def generate(
 
     cache = model.make_cache()
 
-    # Phase 1: Chunked prefill
+    # Prefill: process prompt in chunks
     prompt = prompt.reshape(1, -1)  # [1, seq_len]
     prompt_len = prompt.shape[1]
-    processed = 0
 
-    while prompt_len - processed > 1:
-        chunk_size = min(prefill_chunk_size, prompt_len - processed - 1)
-        chunk = prompt[:, processed : processed + chunk_size]
-        model(chunk, cache=cache)
-        mx.eval([c.state for c in cache])
-        processed += chunk_size
-
-    # Process last token(s) of prompt to get first logits
-    logits = model(prompt[:, processed:], cache=cache)
-    logits = logits[:, -1, :]  # [1, vocab_size]
+    if prompt_len <= prefill_chunk_size:
+        # Small prompt — single forward pass
+        logits = model(prompt, cache=cache)
+        logits = logits[:, -1, :]  # [1, vocab_size]
+    else:
+        # Large prompt — chunked prefill
+        processed = 0
+        while prompt_len - processed > prefill_chunk_size:
+            chunk = prompt[:, processed : processed + prefill_chunk_size]
+            model(chunk, cache=cache)
+            mx.eval([c.state for c in cache])
+            processed += prefill_chunk_size
+        # Process remaining tokens
+        logits = model(prompt[:, processed:], cache=cache)
+        logits = logits[:, -1, :]
 
     y = _sample(logits, temperature)
     mx.async_eval(y)
