@@ -71,7 +71,7 @@ def generate(
         prev = y
         for _ in range(remaining):
             logits = model(prev.reshape(1, 1), cache=cache)
-            logits = logits.squeeze(1)
+            logits = logits[:, -1, :]
             prev = _sample(logits, temperature)
             tokens.append(prev)
 
