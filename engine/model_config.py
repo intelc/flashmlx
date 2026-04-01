@@ -94,8 +94,11 @@ class Attention(nn.Module):
         v = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         offset = cache.offset if cache is not None else 0
-        q = self.rope(q, offset=offset)
-        k = self.rope(k, offset=offset)
+        # Batch RoPE: concatenate Q and K along head dim, apply once, split back
+        qk = mx.concatenate([q, k], axis=1)
+        qk = self.rope(qk, offset=offset)
+        q = qk[:, :self.n_heads, :, :]
+        k = qk[:, self.n_heads:, :, :]
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
