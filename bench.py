@@ -6,8 +6,8 @@ from engine import load_model, generate
 MODEL_REPO = "mlx-community/Qwen3-0.6B-4bit"
 PROMPT_TOKENS = list(range(1, 129))  # 128 tokens
 GEN_TOKENS = 128
-NUM_RUNS = 3
-WARMUP_TOKENS = 20
+NUM_RUNS = 5
+WARMUP_TOKENS = 64
 
 
 def bench():
