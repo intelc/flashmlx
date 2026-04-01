@@ -137,10 +137,14 @@ void BatchScheduler::prefill_request(Request& req) {
     // Forward pass
     mx::array logits = model_.forward(input_ids, cache_keys, cache_values, cache_offsets);
 
-    // Write updated caches back to pool
+    // Write updated caches back to pool — trim to valid portion for concat decode
+    int n_kv = model_.config().num_key_value_heads;
+    int hd = model_.config().head_dim > 0 ? model_.config().head_dim
+             : model_.config().hidden_size / model_.config().num_attention_heads;
     for (int l = 0; l < num_layers; ++l) {
-        pool_.keys(slot, l) = cache_keys[l];
-        pool_.values(slot, l) = cache_values[l];
+        // Extract just the filled portion [1, n_kv, prompt_len, hd] from the pre-allocated buffer
+        pool_.keys(slot, l) = mx::slice(cache_keys[l], {0, 0, 0, 0}, {1, n_kv, prompt_len, hd});
+        pool_.values(slot, l) = mx::slice(cache_values[l], {0, 0, 0, 0}, {1, n_kv, prompt_len, hd});
     }
 
     // Sample first token from last position logits
