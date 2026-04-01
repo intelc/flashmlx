@@ -32,9 +32,8 @@ def generate(
     if max_tokens == 0:
         return
 
-    # Set generous Metal limits to reduce allocation overhead
-    mx.set_cache_limit(8 * 1024 * 1024 * 1024)  # 8GB cache
-    mx.set_memory_limit(32 * 1024 * 1024 * 1024)  # 32GB total
+    # Set generous Metal cache to reduce allocation overhead
+    mx.set_cache_limit(4 * 1024 * 1024 * 1024)  # 4GB
 
     cache = model.make_cache(prealloc=prealloc_cache)
 
