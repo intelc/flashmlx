@@ -414,7 +414,7 @@ mx::array LlamaModel::attention(
     q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, offset_arr);
     k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, offset_arr);
 
-    // KV cache update — no eval needed, use integer directly
+    // KV cache update — use slice_update for pre-allocated buffers
     int offset_val = cache_offset;
     cache_k = mx::slice_update(cache_k, k, {0, 0, offset_val, 0}, {B, n_kv_heads, offset_val + L, hd});
     cache_v = mx::slice_update(cache_v, v, {0, 0, offset_val, 0}, {B, n_kv_heads, offset_val + L, hd});
