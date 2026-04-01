@@ -1,6 +1,7 @@
 #include "flashmlx/scheduler.h"
 
 #include <iostream>
+#include <chrono>
 
 namespace flashmlx {
 
@@ -171,7 +172,6 @@ void BatchScheduler::decode_request(Request& req) {
     int num_layers = model_.config().num_hidden_layers;
 
     // N-step graph batching: build N forward passes before eval
-    // This matches the Python engine's key optimization
     int N = std::min(32, req.max_tokens - req.generated_count);
 
     std::vector<mx::array> step_tokens;

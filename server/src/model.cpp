@@ -1,4 +1,5 @@
 #include "flashmlx/model.h"
+#include <mlx/compile.h>
 
 #include <fstream>
 #include <iostream>
@@ -7,6 +8,19 @@
 #include <filesystem>
 
 namespace flashmlx {
+
+// Compiled SwiGLU activation: silu(gate) * up → single fused Metal kernel
+static std::vector<mx::array> _swiglu_impl(const std::vector<mx::array>& inputs) {
+    auto& gate = inputs[0];
+    auto& up = inputs[1];
+    return {mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), up)};
+}
+
+static auto compiled_swiglu = mx::compile(_swiglu_impl, /*shapeless=*/true);
+
+static mx::array swiglu(const mx::array& gate, const mx::array& up) {
+    return compiled_swiglu({gate, up})[0];
+}
 
 // ---------------------------------------------------------------------------
 // Minimal JSON value parser (handles ints, floats, bools, strings)
@@ -468,7 +482,7 @@ mx::array LlamaModel::mlp(const mx::array& x, int layer) {
     auto up = linear(x, prefix + ".up_proj");
 
     // SiLU(gate) * up
-    auto activated = mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), up);
+    auto activated = swiglu(gate, up);
 
     return linear(activated, prefix + ".down_proj");
 }
@@ -480,7 +494,7 @@ mx::array LlamaModel::mlp_fast(const mx::array& x, int layer) {
     auto up   = linear_fast(x, lw.up_w,   lw.up_s,   lw.up_b);
 
     // SiLU(gate) * up
-    auto activated = mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), up);
+    auto activated = swiglu(gate, up);
 
     return linear_fast(activated, lw.down_w, lw.down_s, lw.down_b);
 }
