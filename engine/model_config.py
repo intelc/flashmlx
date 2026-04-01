@@ -151,18 +151,15 @@ class Model(nn.Module):
         h = self.embed_tokens(input_ids)
         mask = None
         if h.shape[1] > 1:
-            if cache is not None and cache[0].offset == 0:
-                # First prefill — use optimized "causal" string mask
+            if cache is None or cache[0].offset == 0:
                 mask = "causal"
             else:
-                # Continued prefill with offset — need dense mask
-                offset = cache[0].offset if cache else 0
+                offset = cache[0].offset
                 mask = create_causal_mask(h.shape[1], offset)
+        if cache is None:
+            cache = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
-            h = layer(h, mask, cache[i] if cache else None)
-        # When generating (cache present) with multi-token input, only keep last
-        if cache is not None and h.shape[1] > 1:
-            h = h[:, -1:, :]
+            h = layer(h, mask, cache[i])
         h = self.norm(h)
         if self.args.tie_word_embeddings:
             return self.embed_tokens.as_linear(h)
