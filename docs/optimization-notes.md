@@ -59,7 +59,7 @@ Reshape avoidance (iteration 3), squeeze vs slice (iteration 20), inline samplin
 
 ## Comparison with Other Engines
 
-On Qwen3-0.6B-4bit, 128 generated tokens (2026-04-01):
+### Qwen3-0.6B-4bit (small model), 128 generated tokens:
 
 | Engine | TTFT | Decode tok/s | E2E tok/s |
 |--------|-----:|------------:|----------:|
@@ -68,4 +68,24 @@ On Qwen3-0.6B-4bit, 128 generated tokens (2026-04-01):
 | LM Studio | 166.9ms | 192.9 | 153.1 |
 | bodega | 136.5ms | 141.0 | 123.5 |
 
-ollama's TTFT advantage comes from llama.cpp's highly optimized GGUF prompt processing. FlashMLX's throughput advantage comes primarily from N-step graph batching which no other engine currently implements.
+### Meta-Llama-3-8B-4bit (medium model), 128 generated tokens:
+
+| Engine | TTFT | Decode tok/s | E2E tok/s |
+|--------|-----:|------------:|----------:|
+| LM Studio | 171.6ms | 68.2 | 62.9 |
+| bodega | 128.4ms | 67.0 | 63.3 |
+| ollama 0.19 | 18.2ms | 50.1 | 49.8 |
+| FlashMLX | 360.9ms | 48.2 | 42.8 |
+
+### Analysis
+
+**At 0.6B scale:** FlashMLX dominates throughput. N-step graph batching (building 16 forward passes before eval) amortizes Python and Metal submission overhead. The per-token compute is small enough that this overhead reduction matters.
+
+**At 8B scale:** FlashMLX loses its advantage. The per-token compute now dominates (16x more parameters), and building a 16-step graph adds significant graph construction overhead that doesn't pay for itself. LM Studio and bodega — both MLX-based but with more mature generation loops — achieve 40% higher decode throughput.
+
+**TTFT:** ollama's llama.cpp backend consistently wins TTFT across model sizes. FlashMLX's 361ms TTFT at 8B is worst-in-class, suggesting the prefill path needs optimization (possibly chunked prefill with async eval, or a separate non-batched prefill code path).
+
+**Next targets for autoresearch:**
+1. Reduce graph batching overhead at larger model sizes (adaptive batch size based on model params)
+2. Optimize prefill/TTFT — study ollama's approach
+3. Profile the 8B decode path to find where FlashMLX loses to LM Studio/bodega

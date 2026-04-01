@@ -6,7 +6,9 @@ FlashMLX is a modular inference engine that loads HuggingFace models in MLX form
 
 ## Performance
 
-Benchmarked on Apple M1 Max (64GB) with Qwen3-0.6B (4-bit), generating 128 tokens:
+Benchmarked on Apple M1 Max (64GB), generating 128 tokens. All engines use 4-bit quantized models.
+
+### Qwen3-0.6B (small model)
 
 | Engine | TTFT | Decode tok/s | E2E tok/s |
 |--------|-----:|------------:|----------:|
@@ -15,7 +17,18 @@ Benchmarked on Apple M1 Max (64GB) with Qwen3-0.6B (4-bit), generating 128 token
 | LM Studio | 166.9ms | 192.9 | 153.1 |
 | bodega | 136.5ms | 141.0 | 123.5 |
 
-FlashMLX achieves the highest throughput across both decode-only and end-to-end metrics. ollama has the fastest time-to-first-token due to llama.cpp's highly optimized prompt processing.
+At small model sizes, FlashMLX's N-step graph batching dominates — **+26% e2e over ollama**, +41% over LM Studio.
+
+### Meta-Llama-3-8B (medium model)
+
+| Engine | TTFT | Decode tok/s | E2E tok/s |
+|--------|-----:|------------:|----------:|
+| **LM Studio** | 171.6ms | **68.2** | 62.9 |
+| **bodega** | 128.4ms | 67.0 | **63.3** |
+| ollama 0.19 | **18.2ms** | 50.1 | 49.8 |
+| FlashMLX | 360.9ms | 48.2 | 42.8 |
+
+At 8B scale, FlashMLX's graph batching adds overhead that outweighs its benefits. LM Studio and bodega (both MLX-based) lead with ~68 tok/s decode. ollama has the best TTFT at 18ms. **This is a known gap — optimizing for larger models is the next autoresearch target.**
 
 ### Key Optimizations
 
