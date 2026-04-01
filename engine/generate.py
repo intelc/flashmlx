@@ -47,7 +47,7 @@ def generate(
     logits = logits[:, -1, :]  # [1, vocab_size]
 
     y = _sample(logits, temperature)
-    mx.eval(y)
+    mx.async_eval(y)
 
     for _ in range(max_tokens):
         yield y.item()
@@ -56,7 +56,7 @@ def generate(
         logits = model(y.reshape(1, 1), cache=cache)
         logits = logits[:, -1, :]
         y = _sample(logits, temperature)
-        mx.eval(y)
+        mx.async_eval(y)
 
 
 def _sample(logits: mx.array, temperature: float) -> mx.array:
