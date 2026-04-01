@@ -39,6 +39,24 @@ struct ModelConfig {
     bool norm_topk_prob = false;
 };
 
+// MoE stacked expert weights for a single layer
+// All fields use std::optional because mx::array has no default constructor.
+struct MoEWeights {
+    std::optional<mx::array> router_w;  // [num_experts, hidden_size] — may or may not be quantized
+    std::optional<mx::array> router_s, router_b;  // scales/biases if router is quantized
+    // Stacked expert weights: [num_experts, dim1, dim2] — quantized
+    std::optional<mx::array> gate_w, gate_s, up_w, up_s, down_w, down_s;
+    std::optional<mx::array> gate_b, up_b, down_b;
+    // Shared expert (standard quantized linear)
+    bool has_shared = false;
+    std::optional<mx::array> shared_gate_w, shared_gate_s, shared_up_w, shared_up_s, shared_down_w, shared_down_s;
+    std::optional<mx::array> shared_gate_b, shared_up_b, shared_down_b;
+    // Shared expert gating [1, hidden_size]
+    std::optional<mx::array> shared_expert_gate_w;
+    std::optional<mx::array> shared_expert_gate_s, shared_expert_gate_b;
+    bool shared_expert_gate_quantized = false;
+};
+
 class LlamaModel {
 public:
     explicit LlamaModel(const std::string& model_path);
@@ -93,6 +111,11 @@ private:
     mx::array mlp(const mx::array& x, int layer);
     mx::array mlp_fast(const mx::array& x, int layer);
 
+    // MoE building blocks
+    mx::array moe_block(const mx::array& x, int layer);
+    mx::array switch_mlp(const mx::array& x, const mx::array& indices, int layer);
+    mx::array shared_expert_mlp(const mx::array& x, int layer);
+
     // Fast linear using pre-resolved weight references (no hash lookup)
     mx::array linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,
                           const std::optional<mx::array>& b);
@@ -110,16 +133,24 @@ private:
         // Attention
         mx::array q_w, q_s, k_w, k_s, v_w, v_s, o_w, o_s;
         std::optional<mx::array> q_b, k_b, v_b, o_b;
+        // Attention linear biases (not quantization biases — e.g. Qwen2-MoE)
+        std::optional<mx::array> q_bias, k_bias, v_bias;
         mx::array input_norm_w, post_norm_w;
         bool has_q_norm = false;
         mx::array q_norm_w, k_norm_w;
-        // MLP
+        // MLP (only used for dense layers)
         mx::array gate_w, gate_s, up_w, up_s, down_w, down_s;
         std::optional<mx::array> gate_b, up_b, down_b;
     };
     std::vector<LayerWeights> layer_weights_;
     std::optional<mx::array> norm_w_;   // cached final norm weight
+
+    // MoE weight caches
+    std::vector<bool> layer_is_moe_;
+    std::vector<MoEWeights> moe_weights_;  // indexed by MoE layer index
+
     void build_weight_cache();
+    void build_moe_weight_cache();
 };
 
 } // namespace flashmlx

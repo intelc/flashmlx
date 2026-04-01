@@ -248,11 +248,20 @@ bool LlamaModel::has_weight(const std::string& name) const {
 // ---------------------------------------------------------------------------
 
 void LlamaModel::build_weight_cache() {
+    bool is_moe_model = config_.num_experts > 0;
+
+    // Initialize MoE layer tracking
+    layer_is_moe_.resize(config_.num_hidden_layers, false);
+
     layer_weights_.reserve(config_.num_hidden_layers);
     for (int i = 0; i < config_.num_hidden_layers; i++) {
         std::string p = "layers." + std::to_string(i);
         auto attn  = p + ".self_attn";
         auto mlp_p = p + ".mlp";
+
+        // Check if this layer is MoE (has router/gate weight)
+        bool this_layer_moe = has_weight(mlp_p + ".gate.weight");
+        layer_is_moe_[i] = this_layer_moe;
 
         // Build norms + attention weights
         mx::array input_norm_w  = get_weight(p + ".input_layernorm.weight");
@@ -278,58 +287,184 @@ void LlamaModel::build_weight_cache() {
         std::optional<mx::array> o_b = has_weight(attn + ".o_proj.biases") ?
             std::optional<mx::array>(get_weight(attn + ".o_proj.biases")) : std::nullopt;
 
+        // Attention linear biases (not quantization biases — e.g. Qwen2-MoE has q/k/v bias)
+        std::optional<mx::array> q_bias = has_weight(attn + ".q_proj.bias") ?
+            std::optional<mx::array>(get_weight(attn + ".q_proj.bias")) : std::nullopt;
+        std::optional<mx::array> k_bias = has_weight(attn + ".k_proj.bias") ?
+            std::optional<mx::array>(get_weight(attn + ".k_proj.bias")) : std::nullopt;
+        std::optional<mx::array> v_bias = has_weight(attn + ".v_proj.bias") ?
+            std::optional<mx::array>(get_weight(attn + ".v_proj.bias")) : std::nullopt;
+
         bool has_q_norm = has_weight(attn + ".q_norm.weight");
 
-        mx::array gate_w = get_weight(mlp_p + ".gate_proj.weight");
-        mx::array gate_s = get_weight(mlp_p + ".gate_proj.scales");
-        std::optional<mx::array> gate_b = has_weight(mlp_p + ".gate_proj.biases") ?
-            std::optional<mx::array>(get_weight(mlp_p + ".gate_proj.biases")) : std::nullopt;
+        // MLP weights — only for dense layers
+        // For MoE layers, use dummy placeholders (MLP is handled by moe_block)
+        mx::array gate_w_val = input_norm_w;  // dummy default
+        mx::array gate_s_val = input_norm_w;
+        mx::array up_w_val = input_norm_w;
+        mx::array up_s_val = input_norm_w;
+        mx::array down_w_val = input_norm_w;
+        mx::array down_s_val = input_norm_w;
+        std::optional<mx::array> gate_b_val = std::nullopt;
+        std::optional<mx::array> up_b_val = std::nullopt;
+        std::optional<mx::array> down_b_val = std::nullopt;
 
-        mx::array up_w = get_weight(mlp_p + ".up_proj.weight");
-        mx::array up_s = get_weight(mlp_p + ".up_proj.scales");
-        std::optional<mx::array> up_b = has_weight(mlp_p + ".up_proj.biases") ?
-            std::optional<mx::array>(get_weight(mlp_p + ".up_proj.biases")) : std::nullopt;
+        if (!this_layer_moe) {
+            gate_w_val = get_weight(mlp_p + ".gate_proj.weight");
+            gate_s_val = get_weight(mlp_p + ".gate_proj.scales");
+            gate_b_val = has_weight(mlp_p + ".gate_proj.biases") ?
+                std::optional<mx::array>(get_weight(mlp_p + ".gate_proj.biases")) : std::nullopt;
 
-        mx::array down_w = get_weight(mlp_p + ".down_proj.weight");
-        mx::array down_s = get_weight(mlp_p + ".down_proj.scales");
-        std::optional<mx::array> down_b = has_weight(mlp_p + ".down_proj.biases") ?
-            std::optional<mx::array>(get_weight(mlp_p + ".down_proj.biases")) : std::nullopt;
+            up_w_val = get_weight(mlp_p + ".up_proj.weight");
+            up_s_val = get_weight(mlp_p + ".up_proj.scales");
+            up_b_val = has_weight(mlp_p + ".up_proj.biases") ?
+                std::optional<mx::array>(get_weight(mlp_p + ".up_proj.biases")) : std::nullopt;
 
-        if (has_q_norm) {
-            mx::array q_norm_w = get_weight(attn + ".q_norm.weight");
-            mx::array k_norm_w = get_weight(attn + ".k_norm.weight");
-            layer_weights_.push_back(LayerWeights{
-                std::move(q_w), std::move(q_s), std::move(k_w), std::move(k_s),
-                std::move(v_w), std::move(v_s), std::move(o_w), std::move(o_s),
-                std::move(q_b), std::move(k_b), std::move(v_b), std::move(o_b),
-                std::move(input_norm_w), std::move(post_norm_w),
-                /*has_q_norm=*/true, std::move(q_norm_w), std::move(k_norm_w),
-                std::move(gate_w), std::move(gate_s),
-                std::move(up_w), std::move(up_s),
-                std::move(down_w), std::move(down_s),
-                std::move(gate_b), std::move(up_b), std::move(down_b)
-            });
-        } else {
-            // Provide placeholder arrays for q_norm_w, k_norm_w — they won't be used
-            mx::array dummy = get_weight(p + ".input_layernorm.weight");  // re-use any valid array
-            layer_weights_.push_back(LayerWeights{
-                std::move(q_w), std::move(q_s), std::move(k_w), std::move(k_s),
-                std::move(v_w), std::move(v_s), std::move(o_w), std::move(o_s),
-                std::move(q_b), std::move(k_b), std::move(v_b), std::move(o_b),
-                std::move(input_norm_w), std::move(post_norm_w),
-                /*has_q_norm=*/false, dummy, dummy,
-                std::move(gate_w), std::move(gate_s),
-                std::move(up_w), std::move(up_s),
-                std::move(down_w), std::move(down_s),
-                std::move(gate_b), std::move(up_b), std::move(down_b)
-            });
+            down_w_val = get_weight(mlp_p + ".down_proj.weight");
+            down_s_val = get_weight(mlp_p + ".down_proj.scales");
+            down_b_val = has_weight(mlp_p + ".down_proj.biases") ?
+                std::optional<mx::array>(get_weight(mlp_p + ".down_proj.biases")) : std::nullopt;
         }
+
+        mx::array dummy = input_norm_w;
+        mx::array q_norm_w_val = dummy;
+        mx::array k_norm_w_val = dummy;
+        if (has_q_norm) {
+            q_norm_w_val = get_weight(attn + ".q_norm.weight");
+            k_norm_w_val = get_weight(attn + ".k_norm.weight");
+        }
+
+        layer_weights_.push_back(LayerWeights{
+            std::move(q_w), std::move(q_s), std::move(k_w), std::move(k_s),
+            std::move(v_w), std::move(v_s), std::move(o_w), std::move(o_s),
+            std::move(q_b), std::move(k_b), std::move(v_b), std::move(o_b),
+            std::move(q_bias), std::move(k_bias), std::move(v_bias),
+            std::move(input_norm_w), std::move(post_norm_w),
+            has_q_norm, std::move(q_norm_w_val), std::move(k_norm_w_val),
+            std::move(gate_w_val), std::move(gate_s_val),
+            std::move(up_w_val), std::move(up_s_val),
+            std::move(down_w_val), std::move(down_s_val),
+            std::move(gate_b_val), std::move(up_b_val), std::move(down_b_val)
+        });
     }
 
     // Cache final norm weight
     norm_w_ = get_weight("norm.weight");
 
     std::cout << "[flashmlx] Built weight cache for " << config_.num_hidden_layers << " layers" << std::endl;
+
+    // Build MoE weight cache if needed
+    if (is_moe_model) {
+        build_moe_weight_cache();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MoE weight stacking
+// ---------------------------------------------------------------------------
+
+void LlamaModel::build_moe_weight_cache() {
+    int num_experts = config_.num_experts;
+    int moe_count = 0;
+
+    // Reserve space — we store one MoEWeights per layer (indexed by layer number)
+    // Use a map-like approach: moe_weights_ is sized to num_hidden_layers,
+    // but only MoE layers have valid data.
+    moe_weights_.reserve(config_.num_hidden_layers);
+
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        if (!layer_is_moe_[i]) {
+            // Push a default-ish MoEWeights (won't be accessed)
+            moe_weights_.push_back(MoEWeights{});
+            continue;
+        }
+
+        std::string prefix = "layers." + std::to_string(i) + ".mlp";
+        MoEWeights mw;
+
+        // Router weight — may or may not be quantized
+        mw.router_w = get_weight(prefix + ".gate.weight");
+        if (has_weight(prefix + ".gate.scales")) {
+            mw.router_s = get_weight(prefix + ".gate.scales");
+            if (has_weight(prefix + ".gate.biases")) {
+                mw.router_b = get_weight(prefix + ".gate.biases");
+            }
+        }
+
+        // Stack expert weights
+        auto stack_component = [&](const std::string& proj, const std::string& component) {
+            std::vector<mx::array> parts;
+            parts.reserve(num_experts);
+            for (int e = 0; e < num_experts; e++) {
+                std::string key = prefix + ".experts." + std::to_string(e) + "." + proj + "." + component;
+                parts.push_back(get_weight(key));
+            }
+            return mx::stack(parts, 0);
+        };
+
+        auto stack_optional = [&](const std::string& proj, const std::string& component) -> std::optional<mx::array> {
+            std::string test_key = prefix + ".experts.0." + proj + "." + component;
+            if (!has_weight(test_key)) return std::nullopt;
+            return stack_component(proj, component);
+        };
+
+        mw.gate_w = stack_component("gate_proj", "weight");
+        mw.gate_s = stack_component("gate_proj", "scales");
+        mw.gate_b = stack_optional("gate_proj", "biases");
+
+        mw.up_w = stack_component("up_proj", "weight");
+        mw.up_s = stack_component("up_proj", "scales");
+        mw.up_b = stack_optional("up_proj", "biases");
+
+        mw.down_w = stack_component("down_proj", "weight");
+        mw.down_s = stack_component("down_proj", "scales");
+        mw.down_b = stack_optional("down_proj", "biases");
+
+        // Shared expert
+        std::string se_prefix = prefix + ".shared_expert";
+        mw.has_shared = has_weight(se_prefix + ".gate_proj.weight");
+        if (mw.has_shared) {
+            mw.shared_gate_w = get_weight(se_prefix + ".gate_proj.weight");
+            mw.shared_gate_s = get_weight(se_prefix + ".gate_proj.scales");
+            mw.shared_gate_b = has_weight(se_prefix + ".gate_proj.biases") ?
+                std::optional<mx::array>(get_weight(se_prefix + ".gate_proj.biases")) : std::nullopt;
+
+            mw.shared_up_w = get_weight(se_prefix + ".up_proj.weight");
+            mw.shared_up_s = get_weight(se_prefix + ".up_proj.scales");
+            mw.shared_up_b = has_weight(se_prefix + ".up_proj.biases") ?
+                std::optional<mx::array>(get_weight(se_prefix + ".up_proj.biases")) : std::nullopt;
+
+            mw.shared_down_w = get_weight(se_prefix + ".down_proj.weight");
+            mw.shared_down_s = get_weight(se_prefix + ".down_proj.scales");
+            mw.shared_down_b = has_weight(se_prefix + ".down_proj.biases") ?
+                std::optional<mx::array>(get_weight(se_prefix + ".down_proj.biases")) : std::nullopt;
+
+            // Shared expert gate
+            std::string seg_prefix = prefix + ".shared_expert_gate";
+            mw.shared_expert_gate_w = get_weight(seg_prefix + ".weight");
+            mw.shared_expert_gate_quantized = has_weight(seg_prefix + ".scales");
+            if (mw.shared_expert_gate_quantized) {
+                mw.shared_expert_gate_s = get_weight(seg_prefix + ".scales");
+                mw.shared_expert_gate_b = has_weight(seg_prefix + ".biases") ?
+                    std::optional<mx::array>(get_weight(seg_prefix + ".biases")) : std::nullopt;
+            }
+        }
+
+        // Eval stacked weights to materialize them
+        std::vector<mx::array> to_eval = {
+            *mw.gate_w, *mw.gate_s, *mw.up_w, *mw.up_s, *mw.down_w, *mw.down_s
+        };
+        if (mw.gate_b) to_eval.push_back(*mw.gate_b);
+        if (mw.up_b) to_eval.push_back(*mw.up_b);
+        if (mw.down_b) to_eval.push_back(*mw.down_b);
+        mx::eval(to_eval);
+
+        moe_weights_.push_back(std::move(mw));
+        moe_count++;
+    }
+
+    std::cout << "[flashmlx] Built MoE weight cache for " << moe_count << " MoE layers ("
+              << num_experts << " experts each)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +554,14 @@ mx::array LlamaModel::attention(
     auto q = linear(x, prefix + ".q_proj");  // [B, L, n_heads * hd]
     auto k = linear(x, prefix + ".k_proj");  // [B, L, n_kv_heads * hd]
     auto v = linear(x, prefix + ".v_proj");  // [B, L, n_kv_heads * hd]
+
+    // Add attention linear biases if present (e.g. Qwen2-MoE)
+    std::string q_bias_key = prefix + ".q_proj.bias";
+    if (has_weight(q_bias_key)) q = mx::add(q, get_weight(q_bias_key));
+    std::string k_bias_key = prefix + ".k_proj.bias";
+    if (has_weight(k_bias_key)) k = mx::add(k, get_weight(k_bias_key));
+    std::string v_bias_key = prefix + ".v_proj.bias";
+    if (has_weight(v_bias_key)) v = mx::add(v, get_weight(v_bias_key));
 
     // Reshape to [B, L, n_heads, hd] then transpose to [B, n_heads, L, hd]
     q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
@@ -521,6 +664,150 @@ mx::array LlamaModel::mlp_fast(const mx::array& x, int layer) {
     return linear_fast(activated, lw.down_w, lw.down_s, lw.down_b);
 }
 
+// ---------------------------------------------------------------------------
+// MoE block implementation
+// ---------------------------------------------------------------------------
+
+mx::array LlamaModel::switch_mlp(const mx::array& x, const mx::array& indices, int layer) {
+    // x: [B, L, hidden_size], indices: [B, L, k] (top-k expert indices)
+    const auto& mw = moe_weights_[layer];
+    int group_size = config_.quant_group_size;
+    int bits = config_.quant_bits;
+
+    // expand_dims to [B, L, 1, 1, hidden_size] for gather_qmm
+    auto xe = mx::expand_dims(x, {-2, -3});
+
+    // Sort indices for cache locality when we have enough tokens
+    bool do_sort = indices.size() >= 64;
+    auto idx = indices;
+    std::optional<mx::array> inv_order;
+    auto sorted_x = xe;
+
+    if (do_sort) {
+        // _gather_sort: flatten batch dims, sort by expert index
+        int k_val = indices.shape(-1);
+        auto flat_indices = mx::flatten(indices);
+        auto order = mx::argsort(flat_indices);
+        inv_order = mx::argsort(order);
+
+        // Reorder x: x.flatten(0, -3)[order // k]
+        auto x_flat = mx::flatten(xe, 0, -3);  // [B*L, 1, 1, hidden_size]
+        auto src_indices = mx::floor_divide(order, mx::array(k_val, mx::int32));
+        sorted_x = mx::take(x_flat, src_indices, 0);  // [B*L*k, 1, 1, hidden_size]
+        idx = mx::take(flat_indices, order);  // [B*L*k] sorted expert indices
+    }
+
+    // gate_proj: gather_qmm -> [*, 1, 1, moe_intermediate_size]
+    auto x_gate = mx::gather_qmm(
+        sorted_x, *mw.gate_w, *mw.gate_s, mw.gate_b,
+        std::nullopt, idx,
+        /*transpose=*/true, group_size, bits, "affine", do_sort);
+
+    // up_proj
+    auto x_up = mx::gather_qmm(
+        sorted_x, *mw.up_w, *mw.up_s, mw.up_b,
+        std::nullopt, idx,
+        /*transpose=*/true, group_size, bits, "affine", do_sort);
+
+    // SwiGLU: silu(gate) * up
+    auto activated = swiglu(x_gate, x_up);
+
+    // down_proj
+    auto x_down = mx::gather_qmm(
+        activated, *mw.down_w, *mw.down_s, mw.down_b,
+        std::nullopt, idx,
+        /*transpose=*/true, group_size, bits, "affine", do_sort);
+
+    // Unsort if needed
+    if (do_sort) {
+        // x_down is [B*L*k, 1, 1, hidden_size], unsort then unflatten
+        auto x_unsorted = mx::take(x_down, *inv_order, 0);
+        // Unflatten back to [B, L, k, 1, hidden_size]
+        auto orig_shape = indices.shape();  // [B, L, k]
+        x_down = mx::unflatten(x_unsorted, 0, {orig_shape[0], orig_shape[1], orig_shape[2]});
+    }
+
+    // Squeeze the extra dims: result should be [B, L, k, hidden_size]
+    return mx::squeeze(x_down, -2);
+}
+
+mx::array LlamaModel::shared_expert_mlp(const mx::array& x, int layer) {
+    const auto& mw = moe_weights_[layer];
+    int group_size = config_.quant_group_size;
+    int bits = config_.quant_bits;
+
+    auto gate = mx::quantized_matmul(x, *mw.shared_gate_w, *mw.shared_gate_s, mw.shared_gate_b,
+                                      /*transpose=*/true, group_size, bits);
+    auto up = mx::quantized_matmul(x, *mw.shared_up_w, *mw.shared_up_s, mw.shared_up_b,
+                                    /*transpose=*/true, group_size, bits);
+    auto activated = swiglu(gate, up);
+    return mx::quantized_matmul(activated, *mw.shared_down_w, *mw.shared_down_s, mw.shared_down_b,
+                                 /*transpose=*/true, group_size, bits);
+}
+
+mx::array LlamaModel::moe_block(const mx::array& x, int layer) {
+    // x: [B, L, hidden_size]
+    const auto& mw = moe_weights_[layer];
+    int k = config_.num_experts_per_tok;
+
+    // 1. Router: linear(x) -> softmax -> top-k
+    // Router may or may not be quantized depending on the model
+    mx::array gates(0.0f);
+    if (mw.router_s) {
+        gates = mx::quantized_matmul(x, *mw.router_w, *mw.router_s, mw.router_b,
+                                      /*transpose=*/true, config_.quant_group_size, config_.quant_bits);
+    } else {
+        gates = mx::matmul(x, mx::transpose(*mw.router_w, {1, 0}));
+    }
+    gates = mx::softmax(gates, -1, /*precise=*/true);
+
+    // Top-k selection via argpartition
+    auto neg_gates = mx::negative(gates);
+    auto inds = mx::argpartition(neg_gates, k - 1, -1);  // [B, L, num_experts]
+    // Keep only top-k
+    auto shape = inds.shape();
+    inds = mx::slice(inds, {0, 0, 0}, {shape[0], shape[1], k});  // [B, L, k]
+    inds = mx::stop_gradient(inds);
+
+    // Get scores for the selected experts
+    auto scores = mx::take_along_axis(gates, inds, -1);  // [B, L, k]
+
+    // 2. Expert execution via switch_mlp
+    auto y = switch_mlp(x, inds, layer);  // [B, L, k, hidden_size]
+
+    // 3. Weight by routing scores and sum over experts
+    // scores: [B, L, k] -> [B, L, k, 1] for broadcasting
+    auto scores_expanded = mx::expand_dims(scores, -1);  // [B, L, k, 1]
+    y = mx::multiply(y, scores_expanded);
+    y = mx::sum(y, -2);  // [B, L, hidden_size]
+
+    // 4. Add shared expert output (gated by sigmoid)
+    if (mw.has_shared) {
+        auto shared_out = shared_expert_mlp(x, layer);
+
+        // Shared expert gate: sigmoid(linear(x)) * shared_out
+        mx::array gate_val(0.0f);  // placeholder
+        if (mw.shared_expert_gate_quantized) {
+            gate_val = mx::quantized_matmul(
+                x, *mw.shared_expert_gate_w, *mw.shared_expert_gate_s,
+                mw.shared_expert_gate_b,
+                /*transpose=*/true, config_.quant_group_size, config_.quant_bits);
+        } else {
+            gate_val = mx::matmul(x, mx::transpose(*mw.shared_expert_gate_w, {1, 0}));
+        }
+        gate_val = mx::sigmoid(gate_val);  // [B, L, 1]
+        shared_out = mx::multiply(gate_val, shared_out);
+
+        y = mx::add(y, shared_out);
+    }
+
+    return y;
+}
+
+// ---------------------------------------------------------------------------
+// Transformer block (array-offset — used for prefill and heterogeneous batching)
+// ---------------------------------------------------------------------------
+
 mx::array LlamaModel::transformer_block(
     const mx::array& x, int layer,
     mx::array& cache_k, mx::array& cache_v,
@@ -538,8 +825,14 @@ mx::array LlamaModel::transformer_block(
     // Pre-MLP norm
     auto normed2 = rms_norm(h, get_weight(prefix + ".post_attention_layernorm.weight"));
 
-    // MLP + residual
-    auto mlp_out = mlp(normed2, layer);
+    // MLP + residual — dispatch to MoE or dense
+    auto mlp_out = [&]() -> mx::array {
+        if (!layer_is_moe_.empty() && layer < (int)layer_is_moe_.size() && layer_is_moe_[layer]) {
+            return moe_block(normed2, layer);
+        } else {
+            return mlp(normed2, layer);
+        }
+    }();
     return mx::add(h, mlp_out);
 }
 
@@ -560,6 +853,11 @@ mx::array LlamaModel::attention(
     auto q = linear_fast(x, lw.q_w, lw.q_s, lw.q_b);
     auto k = linear_fast(x, lw.k_w, lw.k_s, lw.k_b);
     auto v = linear_fast(x, lw.v_w, lw.v_s, lw.v_b);
+
+    // Add attention linear biases if present (e.g. Qwen2-MoE)
+    if (lw.q_bias) q = mx::add(q, *lw.q_bias);
+    if (lw.k_bias) k = mx::add(k, *lw.k_bias);
+    if (lw.v_bias) v = mx::add(v, *lw.v_bias);
 
     q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
     k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
@@ -598,7 +896,15 @@ mx::array LlamaModel::transformer_block(
     auto attn_out = attention(normed, layer, cache_k, cache_v, cache_offset);
     auto h = mx::add(x, attn_out);
     auto normed2 = rms_norm(h, lw.post_norm_w);
-    auto mlp_out = mlp_fast(normed2, layer);
+
+    // MLP + residual — dispatch to MoE or dense
+    auto mlp_out = [&]() -> mx::array {
+        if (!layer_is_moe_.empty() && layer < (int)layer_is_moe_.size() && layer_is_moe_[layer]) {
+            return moe_block(normed2, layer);
+        } else {
+            return mlp_fast(normed2, layer);
+        }
+    }();
     return mx::add(h, mlp_out);
 }
 
