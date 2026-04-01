@@ -33,6 +33,23 @@ static mx::array relu2(const mx::array& x) {
     return compiled_relu2({x})[0];
 }
 
+// Compiled softplus + clip for Mamba dt, matching mlx_lm.models.ssm.compute_dt.
+static std::vector<mx::array> _compute_dt_impl(const std::vector<mx::array>& inputs) {
+    auto shifted = mx::add(inputs[0], inputs[1]);
+    auto softplus = mx::logaddexp(shifted, mx::zeros_like(shifted));
+    return {mx::clip(softplus, inputs[2], inputs[3])};
+}
+static auto compiled_compute_dt = mx::compile(_compute_dt_impl, /*shapeless=*/true);
+
+static mx::array compute_dt(
+    const mx::array& dt,
+    const mx::array& dt_bias,
+    float dt_min,
+    float dt_max) {
+    return compiled_compute_dt(
+        {dt, dt_bias, mx::array(dt_min, mx::float32), mx::array(dt_max, mx::float32)})[0];
+}
+
 // ---------------------------------------------------------------------------
 // Minimal JSON helpers (same as model.cpp — duplicated to keep files independent)
 // ---------------------------------------------------------------------------
@@ -494,11 +511,7 @@ mx::array NemotronHModel::mamba_block(
 
         // Compute dt: softplus + clip
         auto dt_bias = get_weight(prefix + ".dt_bias");  // [n_heads]
-        dt = mx::add(dt, dt_bias);
-        // softplus: log(1 + exp(x))
-        dt = mx::log1p(mx::exp(dt));
-        // clip
-        dt = mx::clip(dt, mx::array(time_step_min_), mx::array(time_step_max_));
+        dt = compute_dt(dt, dt_bias, time_step_min_, time_step_max_);
         dt = mx::reshape(dt, {B_dim, mamba_num_heads_});  // [B, n_heads]
 
         // SSM kernel
@@ -543,14 +556,9 @@ mx::array NemotronHModel::mamba_block(
         // silu(gate) * y
         auto gated = swiglu_nh(gate, y);
 
-        // Group RMS norm: unflatten to [B, 1, n_groups, d_inner/n_groups],
-        // rms_norm per group, flatten back
         int group_dim = d_inner_ / n_groups_;
         gated = mx::reshape(gated, {B_dim, 1, n_groups_, group_dim});
-        // RMS norm per group (last axis)
-        auto sq = mx::mean(mx::square(gated), -1, /*keepdims=*/true);
-        auto rms = mx::rsqrt(mx::add(sq, mx::array(config_.rms_norm_eps)));
-        gated = mx::multiply(gated, rms);
+        gated = mx::fast::rms_norm(gated, std::nullopt, config_.rms_norm_eps);
         gated = mx::reshape(gated, {B_dim, 1, d_inner_});
 
         // Multiply by norm weight
@@ -605,9 +613,7 @@ mx::array NemotronHModel::mamba_block(
 
         // Compute dt
         auto dt_bias = get_weight(prefix + ".dt_bias");
-        dt = mx::add(dt, dt_bias);
-        dt = mx::log1p(mx::exp(dt));
-        dt = mx::clip(dt, mx::array(time_step_min_), mx::array(time_step_max_));
+        dt = compute_dt(dt, dt_bias, time_step_min_, time_step_max_);
 
         // For prefill, we run SSM sequentially over time steps
         auto A_log = get_weight(prefix + ".A_log");
@@ -666,9 +672,7 @@ mx::array NemotronHModel::mamba_block(
 
         int group_dim = d_inner_ / n_groups_;
         gated = mx::reshape(gated, {B_dim, L, n_groups_, group_dim});
-        auto sq = mx::mean(mx::square(gated), -1, /*keepdims=*/true);
-        auto rms = mx::rsqrt(mx::add(sq, mx::array(config_.rms_norm_eps)));
-        gated = mx::multiply(gated, rms);
+        gated = mx::fast::rms_norm(gated, std::nullopt, config_.rms_norm_eps);
         gated = mx::reshape(gated, {B_dim, L, d_inner_});
 
         auto norm_w = get_weight(prefix + ".norm.weight");
@@ -705,15 +709,24 @@ mx::array NemotronHModel::attention_block(
 
     // NO RoPE for Nemotron-H attention
 
-    // KV cache update (concat approach for decode)
-    cache_k = mx::concatenate({cache_k, k}, 2);
-    cache_v = mx::concatenate({cache_v, v}, 2);
+    cache_k = mx::slice_update(
+        cache_k, k,
+        {0, 0, cache_offset, 0},
+        {B_dim, n_kv_heads, cache_offset + L, hd});
+    cache_v = mx::slice_update(
+        cache_v, v,
+        {0, 0, cache_offset, 0},
+        {B_dim, n_kv_heads, cache_offset + L, hd});
+
+    int total_len = cache_offset + L;
+    auto full_k = mx::slice(cache_k, {0, 0, 0, 0}, {B_dim, n_kv_heads, total_len, hd});
+    auto full_v = mx::slice(cache_v, {0, 0, 0, 0}, {B_dim, n_kv_heads, total_len, hd});
 
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     std::string mask_mode = (L > 1) ? "causal" : "";
 
     auto attn_out = mx::fast::scaled_dot_product_attention(
-        q, cache_k, cache_v, scale, mask_mode);
+        q, full_k, full_v, scale, mask_mode);
 
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B_dim, L, n_heads * hd});
 
@@ -806,6 +819,25 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
         selection_scores = mx::add(selection_scores, get_weight(prefix + "gate.e_score_correction_bias"));
     }
 
+    if (config_.n_group > 1) {
+        selection_scores = mx::unflatten(selection_scores, -1, {config_.n_group, -1});
+        auto group_scores = mx::sum(mx::topk(selection_scores, 2, -1), -1, /*keepdims=*/true);
+        int groups_to_zero = config_.n_group - config_.topk_group;
+        if (groups_to_zero > 0) {
+            auto group_idx = mx::argpartition(group_scores, groups_to_zero - 1, -2);
+            group_idx = mx::slice(
+                group_idx,
+                {0, 0, 0, 0},
+                {B_dim, L, groups_to_zero, group_scores.shape(3)});
+            selection_scores = mx::put_along_axis(
+                selection_scores,
+                group_idx,
+                mx::array(0.0f, selection_scores.dtype()),
+                -2);
+        }
+        selection_scores = mx::flatten(selection_scores, -2, -1);
+    }
+
     // 2. Top-k selection from selection_scores, but use orig_scores for weighting
     auto neg = mx::negative(selection_scores);
     auto topk_inds = mx::argpartition(neg, k - 1, -1);
@@ -837,16 +869,38 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
         fc2_b = get_weight(prefix + "switch_mlp.fc2.biases");
     }
 
-    auto h = mx::gather_qmm(x_exp, fc1_w, fc1_s, fc1_b,
-                             std::nullopt, topk_inds, /*transpose=*/true,
-                             config_.quant_group_size, config_.quant_bits, "affine", false);
-    // relu^2
-    h = relu2(h);
-    h = mx::gather_qmm(h, fc2_w, fc2_s, fc2_b,
-                        std::nullopt, topk_inds, /*transpose=*/true,
-                        config_.quant_group_size, config_.quant_bits, "affine", false);
+    bool do_sort = topk_inds.size() >= 64;
+    auto h = [&]() {
+        if (do_sort) {
+            auto flat_x = mx::flatten(x_exp, 0, -3);
+            auto flat_inds = mx::flatten(topk_inds);
+            auto order = mx::argsort(flat_inds);
+            auto inv_order = mx::argsort(order);
+            auto routed_rows = mx::floor_divide(order, mx::array(k, order.dtype()));
+            auto sorted_x = mx::take(flat_x, routed_rows, 0);
+            auto sorted_inds = mx::take(flat_inds, order, 0);
 
-    h = mx::squeeze(h, -2);  // [B, L, k, hidden]
+            auto sorted_h = mx::gather_qmm(sorted_x, fc1_w, fc1_s, fc1_b,
+                                           std::nullopt, sorted_inds, /*transpose=*/true,
+                                           config_.quant_group_size, config_.quant_bits, "affine", true);
+            sorted_h = relu2(sorted_h);
+            sorted_h = mx::gather_qmm(sorted_h, fc2_w, fc2_s, fc2_b,
+                                      std::nullopt, sorted_inds, /*transpose=*/true,
+                                      config_.quant_group_size, config_.quant_bits, "affine", true);
+            sorted_h = mx::take(sorted_h, inv_order, 0);
+            sorted_h = mx::unflatten(sorted_h, 0, {B_dim, L, k});
+            return mx::squeeze(sorted_h, -2);  // [B, L, k, hidden]
+        }
+
+        auto unsorted_h = mx::gather_qmm(x_exp, fc1_w, fc1_s, fc1_b,
+                                         std::nullopt, topk_inds, /*transpose=*/true,
+                                         config_.quant_group_size, config_.quant_bits, "affine", false);
+        unsorted_h = relu2(unsorted_h);
+        unsorted_h = mx::gather_qmm(unsorted_h, fc2_w, fc2_s, fc2_b,
+                                    std::nullopt, topk_inds, /*transpose=*/true,
+                                    config_.quant_group_size, config_.quant_bits, "affine", false);
+        return mx::squeeze(unsorted_h, -2);  // [B, L, k, hidden]
+    }();
 
     // 4. Weighted sum
     auto y = mx::multiply(h, mx::expand_dims(topk_scores, -1));
@@ -855,7 +909,7 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
     // 5. Shared expert
     if (config_.n_shared_experts > 0 && has_weight(prefix + "shared_experts.up_proj.weight")) {
         auto shared = linear(x, prefix + "shared_experts.up_proj");
-        shared = mx::square(mx::maximum(shared, mx::array(0.0f)));  // relu^2
+        shared = relu2(shared);
         shared = linear(shared, prefix + "shared_experts.down_proj");
         y = mx::add(y, shared);
     }

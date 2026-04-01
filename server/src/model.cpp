@@ -873,11 +873,17 @@ mx::array LlamaModel::attention(
     q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, cache_offset);
     k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, cache_offset);
 
-    // KV cache update — concat approach (pool stores trimmed caches after prefill)
-    cache_k = mx::concatenate({cache_k, k}, 2);
-    cache_v = mx::concatenate({cache_v, v}, 2);
-    auto full_k = cache_k;
-    auto full_v = cache_v;
+    cache_k = mx::slice_update(
+        cache_k, k,
+        {0, 0, cache_offset, 0},
+        {B, n_kv_heads, cache_offset + L, hd});
+    cache_v = mx::slice_update(
+        cache_v, v,
+        {0, 0, cache_offset, 0},
+        {B, n_kv_heads, cache_offset + L, hd});
+    int total_len = cache_offset + L;
+    auto full_k = mx::slice(cache_k, {0, 0, 0, 0}, {B, n_kv_heads, total_len, hd});
+    auto full_v = mx::slice(cache_v, {0, 0, 0, 0}, {B, n_kv_heads, total_len, hd});
 
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     std::string mask_mode = (L > 1) ? "causal" : "";
