@@ -12,6 +12,7 @@ def generate(
     max_tokens: int = 256,
     temperature: float = 0.0,
     prefill_chunk_size: int = 2048,
+    eval_batch_size: int = 16,
 ) -> Iterator[int]:
     """Generate tokens autoregressively.
 
@@ -21,6 +22,7 @@ def generate(
         max_tokens: Number of tokens to generate
         temperature: Sampling temperature (0.0 = greedy)
         prefill_chunk_size: Process prompt in chunks of this size
+        eval_batch_size: Number of tokens to compute before evaluating (higher = faster but more latency)
 
     Yields:
         Token IDs one at a time
@@ -57,7 +59,7 @@ def generate(
     mx.async_eval(y)
 
     # Generate tokens, building N-step graph before eval
-    BATCH_STEPS = 16
+    BATCH_STEPS = eval_batch_size
     generated = 0
     while generated < max_tokens:
         yield y.item()
