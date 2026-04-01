@@ -10,6 +10,29 @@
 
 namespace flashmlx {
 
+// Compiled SwiGLU: silu(gate) * x → single fused Metal kernel
+static std::vector<mx::array> _swiglu_impl(const std::vector<mx::array>& inputs) {
+    auto& gate = inputs[0];
+    auto& x = inputs[1];
+    return {mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), x)};
+}
+static auto compiled_swiglu_nh = mx::compile(_swiglu_impl, /*shapeless=*/true);
+
+static mx::array swiglu_nh(const mx::array& gate, const mx::array& up) {
+    return compiled_swiglu_nh({gate, up})[0];
+}
+
+// Compiled relu²: relu(x)² → single fused kernel
+static std::vector<mx::array> _relu2_impl(const std::vector<mx::array>& inputs) {
+    auto activated = mx::maximum(inputs[0], mx::array(0.0f));
+    return {mx::square(activated)};
+}
+static auto compiled_relu2 = mx::compile(_relu2_impl, /*shapeless=*/true);
+
+static mx::array relu2(const mx::array& x) {
+    return compiled_relu2({x})[0];
+}
+
 // ---------------------------------------------------------------------------
 // Minimal JSON helpers (same as model.cpp — duplicated to keep files independent)
 // ---------------------------------------------------------------------------
@@ -518,7 +541,7 @@ mx::array NemotronHModel::mamba_block(
         // MambaRMSNormGated: swiglu(gate, y) then group RMSNorm
         // gate: [B, 1, d_inner]
         // silu(gate) * y
-        auto gated = mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), y);
+        auto gated = swiglu_nh(gate, y);
 
         // Group RMS norm: unflatten to [B, 1, n_groups, d_inner/n_groups],
         // rms_norm per group, flatten back
@@ -639,7 +662,7 @@ mx::array NemotronHModel::mamba_block(
         y = mx::reshape(y, {B_dim, L, d_inner_});
 
         // MambaRMSNormGated
-        auto gated = mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), y);
+        auto gated = swiglu_nh(gate, y);
 
         int group_dim = d_inner_ / n_groups_;
         gated = mx::reshape(gated, {B_dim, L, n_groups_, group_dim});
@@ -758,7 +781,7 @@ mx::array NemotronHModel::mlp_block(const mx::array& x, int layer) {
 
     auto up = linear(x, prefix + ".up_proj");
     // relu squared
-    auto activated = mx::square(mx::maximum(up, mx::array(0.0f, up.dtype())));
+    auto activated = relu2(up);
     return linear(activated, prefix + ".down_proj");
 }
 
@@ -818,7 +841,7 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
                              std::nullopt, topk_inds, /*transpose=*/true,
                              config_.quant_group_size, config_.quant_bits, "affine", false);
     // relu^2
-    h = mx::square(mx::maximum(h, mx::array(0.0f)));
+    h = relu2(h);
     h = mx::gather_qmm(h, fc2_w, fc2_s, fc2_b,
                         std::nullopt, topk_inds, /*transpose=*/true,
                         config_.quant_group_size, config_.quant_bits, "affine", false);
