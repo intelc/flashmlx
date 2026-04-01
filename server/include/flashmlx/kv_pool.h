@@ -10,7 +10,7 @@ namespace flashmlx {
 class KVCachePool {
 public:
     KVCachePool(int max_slots, int max_context_len, int num_layers,
-                int n_kv_heads, int head_dim);
+                int n_kv_heads, int head_dim, mx::Dtype dtype = mx::float16);
 
     int allocate();                              // Returns slot index or -1 if full
     void free(int slot_idx);                     // Return slot to pool

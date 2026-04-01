@@ -118,8 +118,8 @@ void LlamaModel::load_config(const std::string& model_path) {
     config_.vocab_size = json_int(json, "vocab_size", 128256);
     config_.max_position_embeddings = json_int(json, "max_position_embeddings", 8192);
     config_.rms_norm_eps = json_float(json, "rms_norm_eps", 1e-5f);
-    config_.rope_theta = json_float(json, "rope_theta", 500000.0f);
-    config_.tie_word_embeddings = json_bool(json, "tie_word_embeddings", false);
+    config_.rope_theta = json_float(json, "rope_theta", 10000.0f);
+    config_.tie_word_embeddings = json_bool(json, "tie_word_embeddings", true);
 
     // Parse nested quantization object
     auto quant_obj = json_value_for_key(json, "quantization");
@@ -188,6 +188,14 @@ LlamaModel::LlamaModel(const std::string& model_path) {
               << " quant=" << config_.quant_bits << "bit"
               << std::endl;
     load_weights(model_path);
+
+    // Detect activation dtype from first layer norm weight
+    if (has_weight("layers.0.input_layernorm.weight")) {
+        config_.activation_dtype = get_weight("layers.0.input_layernorm.weight").dtype();
+        std::cout << "[flashmlx] Activation dtype: "
+                  << (config_.activation_dtype == mx::bfloat16 ? "bfloat16" : "float16")
+                  << std::endl;
+    }
 
     build_weight_cache();
 
@@ -549,10 +557,9 @@ mx::array LlamaModel::attention(
         k = rms_norm(k, lw.k_norm_w);
     }
 
-    // RoPE with integer offset — creates the offset array lazily
-    auto offset_arr = mx::array({cache_offset}, mx::int32);
-    q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, offset_arr);
-    k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, offset_arr);
+    // Match the Python path: use the scalar-offset RoPE overload for homogeneous decode.
+    q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, cache_offset);
+    k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, cache_offset);
 
     // KV cache update — concat approach (pool stores trimmed caches after prefill)
     cache_k = mx::concatenate({cache_k, k}, 2);

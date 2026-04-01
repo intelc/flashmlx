@@ -254,16 +254,14 @@ void BatchScheduler::decode_batch(
         batch_cache_v.push_back(mx::concatenate(v_parts, 0));
     }
 
-    // 3. Build batched cache_offsets [B]
-    //    All should be the same (homogeneous batching), but pass as array
+    // 3. All requests in the group share the same cache offset by construction.
     std::vector<int> offsets;
     for (auto& id : ids) {
         offsets.push_back(active_[id].cache_offset);
     }
-    auto cache_offsets = mx::array(offsets.data(), {B}, mx::int32);
 
-    // 4. Single batched forward pass
-    mx::array logits = model_.forward(input_ids, batch_cache_k, batch_cache_v, cache_offsets);
+    // 4. Single batched forward pass through the homogeneous decode path.
+    mx::array logits = model_.forward(input_ids, batch_cache_k, batch_cache_v, offsets[0]);
 
     // 5. Split KV caches back to individual slots
     for (int l = 0; l < num_layers; l++) {

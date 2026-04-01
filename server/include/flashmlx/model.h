@@ -24,6 +24,9 @@ struct ModelConfig {
     float rope_theta = 500000.0f;
     bool tie_word_embeddings = false;
 
+    // Activation dtype (detected from weights — float16 or bfloat16)
+    mx::Dtype activation_dtype = mx::float16;
+
     // Quantization
     int quant_bits = 0;       // 0 = no quantization
     int quant_group_size = 64;

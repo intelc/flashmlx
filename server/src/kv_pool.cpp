@@ -4,7 +4,7 @@
 namespace flashmlx {
 
 KVCachePool::KVCachePool(int max_slots, int max_context_len, int num_layers,
-                         int n_kv_heads, int head_dim)
+                         int n_kv_heads, int head_dim, mx::Dtype dtype)
     : max_slots_(max_slots),
       max_context_len_(max_context_len),
       num_layers_(num_layers),
@@ -25,9 +25,9 @@ KVCachePool::KVCachePool(int max_slots, int max_context_len, int num_layers,
 
         for (int l = 0; l < num_layers; ++l) {
             cache_keys_[s].emplace_back(
-                mx::zeros({1, n_kv_heads, max_context_len, head_dim}, mx::bfloat16));
+                mx::zeros({1, n_kv_heads, max_context_len, head_dim}, dtype));
             cache_values_[s].emplace_back(
-                mx::zeros({1, n_kv_heads, max_context_len, head_dim}, mx::bfloat16));
+                mx::zeros({1, n_kv_heads, max_context_len, head_dim}, dtype));
 
             all_arrays.push_back(cache_keys_[s][l]);
             all_arrays.push_back(cache_values_[s][l]);
