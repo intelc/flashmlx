@@ -148,6 +148,9 @@ class Model(nn.Module):
             mask = create_causal_mask(h.shape[1], offset)
         for i, layer in enumerate(self.layers):
             h = layer(h, mask, cache[i] if cache else None)
+        # When generating (cache present), only compute logits for last token
+        if cache is not None:
+            h = h[:, -1:, :]
         h = self.norm(h)
         if self.args.tie_word_embeddings:
             return self.embed_tokens.as_linear(h)
