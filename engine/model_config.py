@@ -179,10 +179,15 @@ class Model(nn.Module):
         return [cls() for _ in self.layers]
 
     def sanitize(self, weights: dict) -> dict:
-        return {
-            k: v for k, v in weights.items()
-            if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        sanitized = {}
+        for k, v in weights.items():
+            if "self_attn.rotary_emb.inv_freq" in k:
+                continue
+            # Strip "model." prefix from HF weight keys
+            if k.startswith("model."):
+                k = k[len("model."):]
+            sanitized[k] = v
+        return sanitized
 
 
 def load_model(
