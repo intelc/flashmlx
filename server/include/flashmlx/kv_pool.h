@@ -18,6 +18,7 @@ public:
     mx::array& values(int slot_idx, int layer);  // Get value cache for slot+layer
     int num_free() const;
     int max_slots() const { return max_slots_; }
+    int num_layers() const { return num_layers_; }
 
 private:
     int max_slots_;

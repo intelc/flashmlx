@@ -115,7 +115,7 @@ void BatchScheduler::prefill_request(Request& req) {
     req.kv_slot = slot;
     req.state = RequestState::PREFILLING;
 
-    int num_layers = model_.config().num_hidden_layers;
+    int num_layers = pool_.num_layers();
     int prompt_len = static_cast<int>(req.prompt_tokens.size());
 
     // Build input_ids [1, prompt_len]
@@ -169,7 +169,7 @@ void BatchScheduler::prefill_request(Request& req) {
 
 void BatchScheduler::decode_request(Request& req) {
     int slot = req.kv_slot;
-    int num_layers = model_.config().num_hidden_layers;
+    int num_layers = pool_.num_layers();
 
     // N-step graph batching: build N forward passes before eval
     int N = std::min(32, req.max_tokens - req.generated_count);
@@ -226,7 +226,7 @@ void BatchScheduler::decode_batch(
     std::vector<std::string>& done_ids) {
 
     int B = static_cast<int>(ids.size());
-    int num_layers = model_.config().num_hidden_layers;
+    int num_layers = pool_.num_layers();
 
     // 1. Build batched input_ids [B, 1]
     std::vector<int> tok_ids;
