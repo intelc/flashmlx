@@ -1,5 +1,8 @@
 # tests/test_model_config.py
-from engine.model_config import ModelArgs, detect_architecture
+import json
+import mlx.core as mx
+from mlx.utils import tree_flatten
+from engine.model_config import ModelArgs, Model, detect_architecture, load_model
 
 
 class TestModelArgs:
@@ -65,3 +68,40 @@ class TestDetectArchitecture:
         import pytest
         with pytest.raises(ValueError, match="Unsupported"):
             detect_architecture({"model_type": "unknown_model_xyz"})
+
+
+class TestLoadModel:
+    def test_load_model_from_dir(self, tmp_path):
+        """Test loading from a directory with config.json and safetensors."""
+        config = {
+            "model_type": "llama",
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 100,
+            "head_dim": 8,
+            "tie_word_embeddings": True,
+        }
+        config_path = tmp_path / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        # Create model, save its weights, then reload
+        args = ModelArgs.from_dict(config)
+        model = Model(args)
+        mx.eval(model.parameters())
+
+        # Save weights as safetensors using tree_flatten
+        flat = dict(tree_flatten(model.parameters()))
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+        # Load model from directory
+        loaded_model, tokenizer = load_model(str(tmp_path))
+        assert loaded_model is not None
+        # Should be able to forward pass
+        input_ids = mx.array([[1, 2, 3]])
+        logits = loaded_model(input_ids)
+        assert logits.shape == (1, 3, 100)

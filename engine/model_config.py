@@ -1,8 +1,12 @@
 # engine/model_config.py
+import json
+import glob as glob_module
 from dataclasses import dataclass
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from huggingface_hub import snapshot_download
 
 from engine.attention import scaled_dot_product_attention, create_causal_mask
 from engine.kv_cache import KVCache
@@ -157,3 +161,60 @@ class Model(nn.Module):
             k: v for k, v in weights.items()
             if "self_attn.rotary_emb.inv_freq" not in k
         }
+
+
+def load_model(
+    path_or_repo: str,
+) -> tuple["Model", any]:
+    """Load a model from a local directory or HuggingFace repo.
+
+    Args:
+        path_or_repo: Local path or HF repo ID (e.g. "mlx-community/Qwen3-0.6B-4bit")
+
+    Returns:
+        Tuple of (model, tokenizer). tokenizer is None if transformers is not available
+        or tokenizer files are missing.
+    """
+    model_path = Path(path_or_repo)
+    if not model_path.exists():
+        model_path = Path(snapshot_download(
+            path_or_repo,
+            allow_patterns=["*.json", "model*.safetensors", "tokenizer.model", "*.tiktoken", "*.txt"],
+        ))
+
+    # Load config
+    with open(model_path / "config.json") as f:
+        config = json.load(f)
+
+    # Detect architecture and build model
+    detect_architecture(config)  # raises if unsupported
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+
+    # Load weights from safetensors
+    weight_files = sorted(glob_module.glob(str(model_path / "model*.safetensors")))
+    weights = {}
+    for wf in weight_files:
+        weights.update(mx.load(wf))
+
+    # Sanitize weight keys
+    weights = model.sanitize(weights)
+
+    # Apply quantization if model is quantized
+    quant = QuantConfig.from_model_config(config)
+    if quant is not None:
+        nn.quantize(model, group_size=quant.group_size, bits=quant.bits)
+
+    # Load weights into model
+    model.load_weights(list(weights.items()), strict=False)
+    mx.eval(model.parameters())
+
+    # Load tokenizer
+    tokenizer = None
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+    except Exception:
+        pass
+
+    return model, tokenizer
