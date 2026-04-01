@@ -41,6 +41,7 @@ public:
     void stop();
     std::vector<int> debug_forward(const std::vector<int>& token_ids);
     std::vector<float> debug_embed(const std::vector<int>& token_ids);
+    double benchmark_decode(const std::vector<int>& prompt_tokens, int num_tokens);
 
 private:
     std::unique_ptr<ModelBase> model_;

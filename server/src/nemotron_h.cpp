@@ -22,6 +22,33 @@ static mx::array swiglu_nh(const mx::array& gate, const mx::array& up) {
     return compiled_swiglu_nh({gate, up})[0];
 }
 
+// Compiled MoE routing factory: creates a compiled function for specific k value
+// (matches mlx-lm's @mx.compile group_expert_select which captures k at decoration time)
+static std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
+make_compiled_moe_route(int k) {
+    auto impl = [k](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+        // inputs: [gates, correction_bias, scaling_factor_arr]
+        auto& gates = inputs[0];           // [B, L, num_experts]
+        auto& correction = inputs[1];      // [num_experts]
+        auto& scale = inputs[2];           // scalar
+
+        auto orig_scores = mx::sigmoid(mx::astype(gates, mx::float32));
+        auto selection_scores = mx::add(orig_scores, correction);
+
+        auto topk_inds = mx::argpartition(mx::negative(selection_scores), k - 1, -1);
+        int B = gates.shape(0), L = gates.shape(1);
+        topk_inds = mx::slice(topk_inds, {0, 0, 0}, {B, L, k});
+        auto topk_scores = mx::take_along_axis(orig_scores, topk_inds, -1);
+
+        // Normalize
+        auto denom = mx::add(mx::sum(topk_scores, -1, true), mx::array(1e-20f));
+        topk_scores = mx::multiply(mx::divide(topk_scores, denom), scale);
+
+        return {topk_inds, topk_scores};
+    };
+    return mx::compile(impl, /*shapeless=*/false);
+}
+
 // Compiled relu²: relu(x)² → single fused kernel
 static std::vector<mx::array> _relu2_impl(const std::vector<mx::array>& inputs) {
     auto activated = mx::maximum(inputs[0], mx::array(0.0f));
@@ -166,20 +193,9 @@ NemotronHModel::NemotronHModel(const std::string& model_path) {
                   << std::endl;
     }
 
-    // Pre-dequantize embedding
-    if (has_weight("embeddings.scales")) {
-        auto w = get_weight("embeddings.weight");
-        auto scales = get_weight("embeddings.scales");
-        std::optional<mx::array> biases = std::nullopt;
-        if (has_weight("embeddings.biases")) {
-            biases = get_weight("embeddings.biases");
-        }
-        auto dequant = mx::dequantize(w, scales, biases, config_.quant_group_size, config_.quant_bits);
-        mx::eval({dequant});
-        weights_.insert_or_assign("_embed_dequantized", dequant);
-        std::cout << "[NemotronH] Pre-dequantized embedding: " << dequant.shape(0)
-                  << "x" << dequant.shape(1) << std::endl;
-    }
+    // Skip pre-dequantize embedding to save 700MB GPU memory
+    // Use quantized_matmul for embed instead (like mlx-lm)
+    // if (has_weight("embeddings.scales")) { ... }
 
     // Initialize mamba states (empty — will be initialized on first forward)
     mamba_states_initialized_ = false;
@@ -523,7 +539,7 @@ std::vector<mx::array> NemotronHModel::mamba_block_functional_fast(
         {ssm_out_shape, ssm_state_shape},
         {config_.activation_dtype, config_.activation_dtype},
         std::make_tuple(32, mamba_head_dim_, B_dim * mamba_num_heads_),
-        std::make_tuple(32, 1, 1),
+        std::make_tuple(32, 8, 1),
         {{"T", config_.activation_dtype},
          {"Dh", mamba_head_dim_},
          {"Ds", ssm_state_size_},
@@ -547,6 +563,20 @@ std::vector<mx::array> NemotronHModel::mamba_block_functional_fast(
 }
 
 mx::array NemotronHModel::embed(const mx::array& input_ids) {
+    // Use nn.Embedding approach: take from quantized weights, then dequantize per-token
+    if (has_weight("embeddings.scales")) {
+        auto w = get_weight("embeddings.weight");
+        auto scales = get_weight("embeddings.scales");
+        std::optional<mx::array> biases = std::nullopt;
+        if (has_weight("embeddings.biases"))
+            biases = get_weight("embeddings.biases");
+        // For single token, dequantize the single row
+        auto quant_row = mx::take(w, input_ids, 0);
+        auto scale_row = mx::take(scales, input_ids, 0);
+        auto bias_row = biases ? std::optional<mx::array>(mx::take(*biases, input_ids, 0)) : std::nullopt;
+        return mx::dequantize(quant_row, scale_row, bias_row,
+                              config_.quant_group_size, config_.quant_bits);
+    }
     if (has_weight("_embed_dequantized")) {
         return mx::take(get_weight("_embed_dequantized"), input_ids, 0);
     }
@@ -714,7 +744,7 @@ mx::array NemotronHModel::mamba_block(
             {ssm_out_shape, ssm_state_shape},
             {config_.activation_dtype, config_.activation_dtype},
             std::make_tuple(32, mamba_head_dim_, B_dim * mamba_num_heads_),
-            std::make_tuple(32, 1, 1),
+            std::make_tuple(32, 8, 1),
             {{"T", config_.activation_dtype},
              {"Dh", mamba_head_dim_},
              {"Ds", ssm_state_size_},
@@ -824,7 +854,7 @@ mx::array NemotronHModel::mamba_block(
                 {ssm_out_shape, ssm_state_shape},
                 {config_.activation_dtype, config_.activation_dtype},
                 std::make_tuple(32, mamba_head_dim_, B_dim * mamba_num_heads_),
-                std::make_tuple(32, 1, 1),
+                std::make_tuple(32, 8, 1),
                 {{"T", config_.activation_dtype},
                  {"Dh", mamba_head_dim_},
                  {"Ds", ssm_state_size_},
@@ -987,66 +1017,52 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
     int B_dim = x.shape(0);
     int L = x.shape(1);
 
-    // 1. Router — uses sigmoid scoring (NOT softmax) matching mlx-lm
-    auto gate_w = get_weight(prefix + "gate.weight");
-    auto logits = mx::matmul(x, mx::transpose(gate_w, {1, 0}));
-    // Sigmoid scoring for original scores
-    auto orig_scores = mx::sigmoid(mx::astype(logits, mx::float32));
-    // Add correction bias for expert selection (separate from orig_scores)
-    auto selection_scores = orig_scores;
-    if (has_weight(prefix + "gate.e_score_correction_bias")) {
-        selection_scores = mx::add(selection_scores, get_weight(prefix + "gate.e_score_correction_bias"));
-    }
+    // 1. Router — compiled like mlx-lm's @mx.compile group_expert_select
+    auto& w = *moe_layer_weights_[layer];
+    auto logits = mx::matmul(x, mx::transpose(*w.gate_w, {1, 0}));
 
-    if (config_.n_group > 1) {
-        selection_scores = mx::unflatten(selection_scores, -1, {config_.n_group, -1});
-        auto group_scores = mx::sum(mx::topk(selection_scores, 2, -1), -1, /*keepdims=*/true);
-        int groups_to_zero = config_.n_group - config_.topk_group;
-        if (groups_to_zero > 0) {
-            auto group_idx = mx::argpartition(group_scores, groups_to_zero - 1, -2);
-            group_idx = mx::slice(
-                group_idx,
-                {0, 0, 0, 0},
-                {B_dim, L, groups_to_zero, group_scores.shape(3)});
-            selection_scores = mx::put_along_axis(
-                selection_scores,
-                group_idx,
-                mx::array(0.0f, selection_scores.dtype()),
-                -2);
+    auto topk_inds = mx::array(0);  // placeholder
+    auto topk_scores = mx::array(0.0f);  // placeholder
+    {
+        // Routing using cached weight refs (no string lookups)
+        auto orig_scores = mx::sigmoid(mx::astype(logits, mx::float32));
+        auto selection_scores = orig_scores;
+        if (w.gate_correction_bias.has_value()) {
+            selection_scores = mx::add(selection_scores, *w.gate_correction_bias);
         }
-        selection_scores = mx::flatten(selection_scores, -2, -1);
+        if (config_.n_group > 1) {
+            selection_scores = mx::unflatten(selection_scores, -1, {config_.n_group, -1});
+            auto group_scores = mx::sum(mx::topk(selection_scores, 2, -1), -1, true);
+            int groups_to_zero = config_.n_group - config_.topk_group;
+            if (groups_to_zero > 0) {
+                auto group_idx = mx::argpartition(group_scores, groups_to_zero - 1, -2);
+                group_idx = mx::slice(group_idx, {0, 0, 0, 0},
+                    {B_dim, L, groups_to_zero, group_scores.shape(3)});
+                selection_scores = mx::put_along_axis(selection_scores, group_idx,
+                    mx::array(0.0f, selection_scores.dtype()), -2);
+            }
+            selection_scores = mx::flatten(selection_scores, -2, -1);
+        }
+        topk_inds = mx::argpartition(mx::negative(selection_scores), k - 1, -1);
+        topk_inds = mx::slice(topk_inds, {0, 0, 0}, {B_dim, L, k});
+        topk_scores = mx::take_along_axis(orig_scores, topk_inds, -1);
+        if (config_.norm_topk_prob && k > 1) {
+            auto denom = mx::add(mx::sum(topk_scores, -1, true), mx::array(1e-20f));
+            topk_scores = mx::divide(topk_scores, denom);
+        }
+        topk_scores = mx::multiply(topk_scores, mx::array(config_.routed_scaling_factor));
     }
-
-    // 2. Top-k selection from selection_scores, but use orig_scores for weighting
-    auto neg = mx::negative(selection_scores);
-    auto topk_inds = mx::argpartition(neg, k - 1, -1);
-    topk_inds = mx::slice(topk_inds, {0, 0, 0}, {B_dim, L, k});
-    // Routing weights come from orig_scores (before correction bias)
-    auto topk_scores = mx::take_along_axis(orig_scores, topk_inds, -1);
-
-    // Normalize and scale
-    if (config_.norm_topk_prob && k > 1) {
-        auto denom = mx::add(mx::sum(topk_scores, -1, true), mx::array(1e-20f));
-        topk_scores = mx::divide(topk_scores, denom);
-    }
-    topk_scores = mx::multiply(topk_scores, mx::array(config_.routed_scaling_factor));
 
     // 3. SwitchMLP: fc1 -> relu^2 -> fc2 (via gather_qmm)
     auto x_exp = mx::expand_dims(x, {-2, -3});  // [B, L, 1, 1, hidden]
 
-    auto fc1_w = get_weight(prefix + "switch_mlp.fc1.weight");
-    auto fc1_s = get_weight(prefix + "switch_mlp.fc1.scales");
-    std::optional<mx::array> fc1_b = std::nullopt;
-    if (has_weight(prefix + "switch_mlp.fc1.biases")) {
-        fc1_b = get_weight(prefix + "switch_mlp.fc1.biases");
-    }
-
-    auto fc2_w = get_weight(prefix + "switch_mlp.fc2.weight");
-    auto fc2_s = get_weight(prefix + "switch_mlp.fc2.scales");
-    std::optional<mx::array> fc2_b = std::nullopt;
-    if (has_weight(prefix + "switch_mlp.fc2.biases")) {
-        fc2_b = get_weight(prefix + "switch_mlp.fc2.biases");
-    }
+    // Use cached weight references (no hash lookup)
+    auto& fc1_w = *w.fc1_w;
+    auto& fc1_s = *w.fc1_s;
+    auto& fc1_b = w.fc1_b;
+    auto& fc2_w = *w.fc2_w;
+    auto& fc2_s = *w.fc2_s;
+    auto& fc2_b = w.fc2_b;
 
     bool do_sort = topk_inds.size() >= 64;
     auto h = [&]() {
@@ -1085,11 +1101,13 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
     auto y = mx::multiply(h, mx::expand_dims(topk_scores, -1));
     y = mx::sum(y, -2);  // [B, L, hidden]
 
-    // 5. Shared expert
-    if (config_.n_shared_experts > 0 && has_weight(prefix + "shared_experts.up_proj.weight")) {
-        auto shared = linear(x, prefix + "shared_experts.up_proj");
+    // 5. Shared expert (use cached weights)
+    if (w.has_shared_expert) {
+        auto shared = mx::quantized_matmul(x, *w.shared_up_w, *w.shared_up_s, w.shared_up_b,
+            /*transpose=*/true, config_.quant_group_size, config_.quant_bits);
         shared = relu2(shared);
-        shared = linear(shared, prefix + "shared_experts.down_proj");
+        shared = mx::quantized_matmul(shared, *w.shared_down_w, *w.shared_down_s, w.shared_down_b,
+            /*transpose=*/true, config_.quant_group_size, config_.quant_bits);
         y = mx::add(y, shared);
     }
 
@@ -1169,7 +1187,7 @@ std::vector<mx::array> NemotronHModel::mamba_block_functional(
         {ssm_out_shape, ssm_state_shape},
         {config_.activation_dtype, config_.activation_dtype},
         std::make_tuple(32, mamba_head_dim_, B_dim * mamba_num_heads_),
-        std::make_tuple(32, 1, 1),
+        std::make_tuple(32, 8, 1),
         {{"T", config_.activation_dtype},
          {"Dh", mamba_head_dim_},
          {"Ds", ssm_state_size_},
@@ -1529,11 +1547,12 @@ mx::array NemotronHModel::forward(
         init_mamba_states(B_dim);
     }
 
-    // For single-token decode, use functional forward (no per-layer eval, full graph)
-    if (L == 1) {
-        return compiled_decode(input_ids, cache_keys, cache_values, cache_offset);
+    // Ensure weight cache is built (for fast MoE and compiled mamba)
+    if (!weight_cache_built_) {
+        build_weight_cache();
     }
 
+    // Direct forward: no compiled wrapper, build lazy graph like mlx-lm
     auto h = embed(input_ids);
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
@@ -1565,8 +1584,6 @@ mx::array NemotronHModel::forward(
         }
 
         h = mx::add(h, block_out);
-
-        // Mamba states are updated lazily — no per-block eval needed
     }
 
     // Final norm
@@ -1591,13 +1608,15 @@ mx::array NemotronHModel::forward(
     if (!mamba_states_initialized_) {
         init_mamba_states(B_dim);
     }
+    if (!weight_cache_built_) {
+        build_weight_cache();
+    }
 
     auto h = embed(input_ids);
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
         auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
         auto normed = rms_norm(h, norm_w);
-
 
         mx::array block_out = normed;  // placeholder, overwritten by each branch
         switch (block_types_[i]) {

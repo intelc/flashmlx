@@ -153,6 +153,62 @@ std::vector<float> Engine::debug_embed(const std::vector<int>& token_ids) {
     return model_->debug_embed(token_ids);
 }
 
+double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_tokens) {
+    // Direct decode loop — no scheduler, no threading, no polling
+    // Matches mlx-lm's sequential pattern: forward → eval → next
+    const auto& cfg = model_->config();
+    int n_kv = cfg.num_key_value_heads;
+    int hd = cfg.head_dim > 0 ? cfg.head_dim : cfg.hidden_size / cfg.num_attention_heads;
+    int ctx = 2048;
+
+    // Count KV layers
+    int kv_layers = kv_pool_->num_layers();
+
+    // Create KV caches
+    std::vector<mx::array> cache_k, cache_v;
+    for (int i = 0; i < kv_layers; i++) {
+        cache_k.push_back(mx::zeros({1, n_kv, ctx, hd}, cfg.activation_dtype));
+        cache_v.push_back(mx::zeros({1, n_kv, ctx, hd}, cfg.activation_dtype));
+    }
+    mx::eval(cache_k);
+    mx::eval(cache_v);
+
+    // Prefill
+    auto input = mx::array(prompt_tokens.data(), {1, (int)prompt_tokens.size()}, mx::int32);
+    auto cache_offsets = mx::array({0}, mx::int32);
+    auto logits = model_->forward(input, cache_k, cache_v, cache_offsets);
+    mx::eval({logits});
+
+    int prompt_len = (int)prompt_tokens.size();
+    int seq_len = logits.shape(1);
+    auto last_logits = mx::slice(logits, {0, seq_len - 1, 0}, {1, seq_len, logits.shape(2)});
+    last_logits = mx::reshape(last_logits, {1, -1});
+    auto token = mx::argmax(last_logits, -1);
+    mx::eval({token});
+
+    // Warmup decode (5 steps)
+    for (int i = 0; i < 5; i++) {
+        auto input_ids = mx::reshape(token, {1, 1});
+        logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + i);
+        last_logits = mx::reshape(logits, {1, -1});
+        token = mx::argmax(last_logits, -1);
+        mx::eval({token});
+    }
+
+    // Timed decode loop — sequential eval like mlx-lm
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < num_tokens; i++) {
+        auto input_ids = mx::reshape(token, {1, 1});
+        logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + 5 + i);
+        last_logits = mx::reshape(logits, {1, -1});
+        token = mx::argmax(last_logits, -1);
+        mx::eval({token});
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double elapsed = std::chrono::duration<double>(t1 - t0).count();
+    return num_tokens / elapsed;
+}
+
 } // namespace flashmlx
 
 PYBIND11_MODULE(_flashmlx_engine, m) {
@@ -185,5 +241,7 @@ PYBIND11_MODULE(_flashmlx_engine, m) {
         .def("start", &flashmlx::Engine::start)
         .def("stop", &flashmlx::Engine::stop)
         .def("debug_forward", &flashmlx::Engine::debug_forward)
-        .def("debug_embed", &flashmlx::Engine::debug_embed);
+        .def("debug_embed", &flashmlx::Engine::debug_embed)
+        .def("benchmark_decode", &flashmlx::Engine::benchmark_decode,
+             py::arg("prompt_tokens"), py::arg("num_tokens"));
 }

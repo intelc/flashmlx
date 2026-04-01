@@ -210,6 +210,9 @@ public:
 
     /// Number of attention layers (for KV cache allocation)
     int num_attn_layers() const { return num_attn_layers_; }
+    /// Mamba state accessors (for eval in benchmark)
+    std::vector<mx::array>& mamba_conv_states() { return mamba_conv_states_; }
+    std::vector<mx::array>& mamba_ssm_states() { return mamba_ssm_states_; }
 
 private:
     void load_config(const std::string& model_path);
@@ -338,6 +341,10 @@ private:
     std::vector<std::optional<MLPLayerWeights>> mlp_layer_weights_;
     void build_weight_cache();
     bool weight_cache_built_ = false;
+
+    // Compiled MoE routing function (for n_group=1 fast path)
+    std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_moe_route_;
+    bool compiled_moe_route_initialized_ = false;
 
     // Fast linear using pre-resolved weights (no hash lookup)
     mx::array linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,

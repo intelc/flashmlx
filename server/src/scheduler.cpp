@@ -171,8 +171,16 @@ void BatchScheduler::decode_request(Request& req) {
     int num_layers = pool_.num_layers();
 
     // N-step graph batching: build N forward passes before eval
-    // For large models (>40 layers), 32 steps balances graph size vs eval overhead
-    int batch_n = (model_.config().num_hidden_layers > 40) ? 128 : 32;
+    // Hybrid models (MoE/Mamba) have huge per-step state, so use small N
+    // Dense transformers can batch more aggressively
+    int batch_n;
+    if (model_.config().n_routed_experts > 0 || model_.config().num_hidden_layers > 50) {
+        batch_n = 1;  // MoE/hybrid: 1-step with async pipelining (matches mlx-lm)
+    } else if (model_.config().num_hidden_layers > 40) {
+        batch_n = 32;
+    } else {
+        batch_n = 32;
+    }
     int N = std::min(batch_n, req.max_tokens - req.generated_count);
 
     std::vector<mx::array> step_tokens;
