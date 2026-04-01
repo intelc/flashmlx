@@ -31,7 +31,7 @@ def generate(
         return
 
     # Set generous Metal cache to reduce allocation overhead
-    mx.metal.set_cache_limit(4 * 1024 * 1024 * 1024)  # 4GB
+    mx.set_cache_limit(4 * 1024 * 1024 * 1024)  # 4GB
 
     cache = model.make_cache()
 

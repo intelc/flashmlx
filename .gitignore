@@ -9,3 +9,4 @@ autobench/results.tsv
 *.log
 .DS_Store
 models/
+autoresearch-results.tsv
