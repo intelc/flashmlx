@@ -311,8 +311,10 @@ mx::array LlamaModel::attention(
     // Write into cache at the offset position
     // cache_offsets is [B] int32 — for uniform batch, all values are the same
     // We use the first offset value for slice positioning
-    mx::eval({cache_offsets});
-    int offset_val = cache_offsets.item<int32_t>();  // take first element
+    // For homogeneous batching all offsets are the same — extract first element
+    auto first_offset = mx::slice(cache_offsets, {0}, {1});
+    mx::eval({first_offset});
+    int offset_val = first_offset.item<int32_t>();
 
     // slice_update: write k into cache_k at [0:B, 0:n_kv_heads, offset:offset+L, 0:hd]
     cache_k = mx::slice_update(

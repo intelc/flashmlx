@@ -32,17 +32,38 @@ std::unordered_map<std::string, std::vector<int>> BatchScheduler::step() {
         }
     }
 
-    // 2. Decode one token for each active DECODING request
+    // 2. Batched decode: group requests by cache_offset, decode each group together
     std::vector<std::string> done_ids;
+
+    // Collect all decoding requests
+    std::vector<std::string> decoding_ids;
     for (auto& [id, req] : active_) {
-        if (req.state != RequestState::DECODING) continue;
+        if (req.state == RequestState::DECODING) {
+            decoding_ids.push_back(id);
+        }
+    }
 
-        decode_request(req);
-        new_tokens[id].push_back(req.output_tokens.back());
+    if (!decoding_ids.empty()) {
+        // Group by cache_offset for homogeneous batching
+        std::unordered_map<int, std::vector<std::string>> offset_groups;
+        for (auto& id : decoding_ids) {
+            offset_groups[active_[id].cache_offset].push_back(id);
+        }
 
-        if (req.generated_count >= req.max_tokens) {
-            req.state = RequestState::DONE;
-            done_ids.push_back(id);
+        for (auto& [offset, group_ids] : offset_groups) {
+            if (group_ids.size() == 1) {
+                // Single request — use existing path
+                auto& req = active_[group_ids[0]];
+                decode_request(req);
+                new_tokens[group_ids[0]].push_back(req.output_tokens.back());
+                if (req.generated_count >= req.max_tokens) {
+                    req.state = RequestState::DONE;
+                    done_ids.push_back(group_ids[0]);
+                }
+            } else {
+                // Batch decode multiple requests at the same offset
+                decode_batch(group_ids, new_tokens, done_ids);
+            }
         }
     }
 
@@ -177,6 +198,87 @@ void BatchScheduler::decode_request(Request& req) {
     req.output_tokens.push_back(new_tok_id);
     req.generated_count++;
     req.cache_offset++;
+}
+
+void BatchScheduler::decode_batch(
+    const std::vector<std::string>& ids,
+    std::unordered_map<std::string, std::vector<int>>& new_tokens,
+    std::vector<std::string>& done_ids) {
+
+    int B = static_cast<int>(ids.size());
+    int num_layers = model_.config().num_hidden_layers;
+
+    // 1. Build batched input_ids [B, 1]
+    std::vector<int> tok_ids;
+    tok_ids.reserve(B);
+    for (auto& id : ids) {
+        tok_ids.push_back(active_[id].next_token.item<int>());
+    }
+    auto input_ids = mx::array(tok_ids.data(), {B, 1}, mx::int32);
+
+    // 2. Build batched KV caches by concatenating slots along batch dim
+    //    Each slot is [1, n_kv_heads, max_ctx, hd]
+    //    Concatenated: [B, n_kv_heads, max_ctx, hd]
+    std::vector<mx::array> batch_cache_k, batch_cache_v;
+    batch_cache_k.reserve(num_layers);
+    batch_cache_v.reserve(num_layers);
+
+    for (int l = 0; l < num_layers; l++) {
+        std::vector<mx::array> k_parts, v_parts;
+        for (auto& id : ids) {
+            int slot = active_[id].kv_slot;
+            k_parts.push_back(pool_.keys(slot, l));
+            v_parts.push_back(pool_.values(slot, l));
+        }
+        batch_cache_k.push_back(mx::concatenate(k_parts, 0));
+        batch_cache_v.push_back(mx::concatenate(v_parts, 0));
+    }
+
+    // 3. Build batched cache_offsets [B]
+    //    All should be the same (homogeneous batching), but pass as array
+    std::vector<int> offsets;
+    for (auto& id : ids) {
+        offsets.push_back(active_[id].cache_offset);
+    }
+    auto cache_offsets = mx::array(offsets.data(), {B}, mx::int32);
+
+    // 4. Single batched forward pass
+    mx::array logits = model_.forward(input_ids, batch_cache_k, batch_cache_v, cache_offsets);
+
+    // 5. Split KV caches back to individual slots
+    for (int l = 0; l < num_layers; l++) {
+        for (int b = 0; b < B; b++) {
+            int slot = active_[ids[b]].kv_slot;
+            pool_.keys(slot, l) = mx::slice(batch_cache_k[l], {b, 0, 0, 0},
+                {b + 1, batch_cache_k[l].shape(1), batch_cache_k[l].shape(2), batch_cache_k[l].shape(3)});
+            pool_.values(slot, l) = mx::slice(batch_cache_v[l], {b, 0, 0, 0},
+                {b + 1, batch_cache_v[l].shape(1), batch_cache_v[l].shape(2), batch_cache_v[l].shape(3)});
+        }
+    }
+
+    // 6. Sample tokens per-request
+    //    logits shape: [B, 1, vocab_size]
+    for (int b = 0; b < B; b++) {
+        auto& req = active_[ids[b]];
+        auto req_logits = mx::slice(logits, {b, 0, 0}, {b + 1, 1, logits.shape(2)});
+        req_logits = mx::reshape(req_logits, {1, -1});
+
+        mx::array token = sample_token(req_logits, req.temperature);
+        mx::eval({token});
+        int tok_id = token.item<int>();
+
+        req.next_token = token;
+        req.output_tokens.push_back(tok_id);
+        req.generated_count++;
+        req.cache_offset++;
+
+        new_tokens[ids[b]].push_back(tok_id);
+
+        if (req.generated_count >= req.max_tokens) {
+            req.state = RequestState::DONE;
+            done_ids.push_back(ids[b]);
+        }
+    }
 }
 
 } // namespace flashmlx

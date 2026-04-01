@@ -56,6 +56,9 @@ public:
 private:
     void prefill_request(Request& req);
     void decode_request(Request& req);
+    void decode_batch(const std::vector<std::string>& ids,
+                      std::unordered_map<std::string, std::vector<int>>& new_tokens,
+                      std::vector<std::string>& done_ids);
 
     LlamaModel& model_;
     KVCachePool& pool_;
