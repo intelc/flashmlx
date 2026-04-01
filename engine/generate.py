@@ -46,16 +46,16 @@ def generate(
     logits = model(prompt[:, processed:], cache=cache)
     logits = logits[:, -1, :]  # [1, vocab_size]
 
-    y = _sample(logits, temperature).reshape(1, 1)
+    y = _sample(logits, temperature)
     mx.eval(y)
 
     for _ in range(max_tokens):
         yield y.item()
 
-        # Compute next token — y is already (1, 1), no reshape needed
-        logits = model(y, cache=cache)
+        # Compute next token
+        logits = model(y.reshape(1, 1), cache=cache)
         logits = logits[:, -1, :]
-        y = _sample(logits, temperature).reshape(1, 1)
+        y = _sample(logits, temperature)
         mx.eval(y)
 
 
