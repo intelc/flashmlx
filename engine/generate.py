@@ -56,14 +56,32 @@ def generate(
     y = _sample(logits, temperature)
     mx.async_eval(y)
 
-    for _ in range(max_tokens):
+    # Generate tokens, building 2-step graph when possible
+    generated = 0
+    while generated < max_tokens:
         yield y.item()
+        generated += 1
+        if generated >= max_tokens:
+            break
 
-        # Compute next token
+        # Build 2-step computation graph before eval
         logits = model(y.reshape(1, 1), cache=cache)
         logits = logits[:, -1, :]
-        y = _sample(logits, temperature)
-        mx.async_eval(y)
+        y1 = _sample(logits, temperature)
+
+        logits2 = model(y1.reshape(1, 1), cache=cache)
+        logits2 = logits2[:, -1, :]
+        y2 = _sample(logits2, temperature)
+
+        # Eval both tokens at once
+        mx.async_eval(y1, y2)
+
+        yield y1.item()
+        generated += 1
+        if generated >= max_tokens:
+            break
+
+        y = y2
 
 
 def _sample(logits: mx.array, temperature: float) -> mx.array:
