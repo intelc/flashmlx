@@ -1,0 +1,26 @@
+# harness/models.yaml
+small_tier:
+  - name: qwen3-0.6b
+    repo: mlx-community/Qwen3-0.6B-4bit
+    arch: llama
+    params: 0.6B
+    role: primary_iteration
+
+  - name: smollm2-1.7b
+    repo: mlx-community/SmolLM2-1.7B-Instruct-4bit
+    arch: llama
+    params: 1.7B
+    role: secondary_iteration
+
+medium_tier:
+  - name: llama3-8b
+    repo: mlx-community/Meta-Llama-3-8B-4bit
+    arch: llama
+    params: 8B
+    role: validation
+
+  - name: mistral-7b
+    repo: mlx-community/Mistral-7B-Instruct-v0.3-4bit
+    arch: llama
+    params: 7B
+    role: validation
