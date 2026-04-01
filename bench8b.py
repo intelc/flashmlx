@@ -15,12 +15,12 @@ def bench():
     prompt = mx.array(PROMPT_TOKENS)
 
     # Warmup
-    for _ in generate(model, prompt, max_tokens=WARMUP_TOKENS, temperature=0.0, eval_batch_size=1):
+    for _ in generate(model, prompt, max_tokens=WARMUP_TOKENS, temperature=0.0):
         pass
 
     tok_s_runs = []
     for _ in range(NUM_RUNS):
-        gen_iter = generate(model, prompt, max_tokens=GEN_TOKENS, temperature=0.0, eval_batch_size=1)
+        gen_iter = generate(model, prompt, max_tokens=GEN_TOKENS, temperature=0.0)
         t_start = time.perf_counter()
         tokens = [t for t in gen_iter]
         t_end = time.perf_counter()
