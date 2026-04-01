@@ -49,18 +49,14 @@ def generate(
     y = _sample(logits, temperature)
     mx.eval(y)
 
-    for i in range(max_tokens):
-        # Start computing next token BEFORE yielding current one
-        next_logits = model(y.reshape(1, 1), cache=cache)
-        next_logits = next_logits[:, -1, :]
-        next_y = _sample(next_logits, temperature)
-
-        # Now yield current token (Metal is computing next_y in parallel)
+    for _ in range(max_tokens):
         yield y.item()
 
-        # Eval the next token
-        mx.eval(next_y)
-        y = next_y
+        # Compute next token
+        logits = model(y.reshape(1, 1), cache=cache)
+        logits = logits[:, -1, :]
+        y = _sample(logits, temperature)
+        mx.eval(y)
 
 
 def _sample(logits: mx.array, temperature: float) -> mx.array:
