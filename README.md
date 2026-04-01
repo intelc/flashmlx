@@ -6,40 +6,56 @@ FlashMLX is a modular inference engine that loads HuggingFace models in MLX form
 
 ## Performance
 
-Benchmarked on Apple M1 Max (64GB), generating 128 tokens. All engines use 4-bit quantized models.
+Benchmarked on Apple M1 Max (64GB), 4-bit quantized models. FlashMLX includes both a Python engine and a C++ inference server.
 
-### Qwen3-0.6B (small model)
+### Qwen3-0.6B — Server Throughput (tok/s)
 
-| Engine | TTFT | Decode tok/s | E2E tok/s |
-|--------|-----:|------------:|----------:|
-| **FlashMLX** | 27.8ms | **249** | **248** |
-| ollama 0.19 | **5.8ms** | 172.9 | 171.5 |
-| LM Studio | 166.9ms | 192.9 | 153.1 |
-| bodega | 136.5ms | 141.0 | 123.5 |
+| Engine | C=1 | C=4 | C=8 |
+|--------|----:|----:|----:|
+| **FlashMLX C++ Server** | **232** | 218 | **233** |
+| Python FlashMLX (seq) | — | 259 | — |
+| LM Studio | 227 | **326** | — |
+| ollama 0.19 | 180 | 199 | — |
+| bodega | 124 | 105 | — |
 
-At small model sizes, FlashMLX dominates — **+45% e2e over ollama**, +62% over LM Studio.
+FlashMLX C++ server beats ollama by 29% and matches LM Studio at C=1. LM Studio leads at C=4 due to continuous batching with heterogeneous offsets.
 
-### Meta-Llama-3-8B (medium model)
+### Qwen3-8B — Server Throughput (tok/s)
 
-| Engine | TTFT | Decode tok/s | E2E tok/s |
-|--------|-----:|------------:|----------:|
-| **FlashMLX** | ~250ms | **63.1** | **58.5** |
-| LM Studio | 171.6ms | 68.2 | 62.9 |
-| bodega | 128.4ms | 67.0 | 63.3 |
-| ollama 0.19 | **18.2ms** | 50.1 | 49.8 |
+| Engine | C=1 | C=4 |
+|--------|----:|----:|
+| **FlashMLX C++ Server** | **52** | **53** |
+| Python FlashMLX (seq) | 52 | — |
+| ollama | 41 | — |
 
-At 8B scale, FlashMLX's per-token decode (63.1 tok/s) matches LM Studio. E2E is slightly lower due to prefill overhead. ollama has the best TTFT. **Next: C++ batched inference server to push total throughput beyond single-request limits.**
+FlashMLX matches its Python engine and beats ollama by 28% on Qwen3-8B.
+
+### Meta-Llama-3-8B — Server Throughput (tok/s)
+
+| Engine | C=1 | C=4 |
+|--------|----:|----:|
+| LM Studio | 59 | **83** |
+| Python FlashMLX (seq) | — | 60 |
+| ollama | **58** | 63 |
+| FlashMLX C++ Server | 43 | 59 |
+
+At 8B with non-quantized embeddings, the C++ server has higher graph overhead. Scales to match Python at C=4.
 
 ### Key Optimizations
 
-- **Correct float16 weight loading**: Fixed critical bug where HF weight keys were silently skipped, causing float32 fallback (+13% on 8B, +30% on 0.6B)
-- **`mx.compile` on decode step**: Compiles full model forward pass with PreAllocKVCache for Metal kernel fusion (+7% on 8B)
-- **N-step graph batching**: Builds up to 64 sequential forward passes before `mx.async_eval`, amortizing dispatch overhead (+24% on 0.6B)
-- **Compiled fused ops**: `fused_residual_rms_norm` and `fused_rms_norm` reduce kernel dispatches
-- **Async evaluation**: `mx.async_eval` overlaps Metal GPU compute with Python execution (+6%)
-- **Concat-based KV cache**: Simpler `mx.concatenate` instead of pre-allocated slice assignment — better MLX graph optimization
-- **Single-pass prefill**: Small prompts processed in one forward pass instead of chunked
-- **Last-token-only lm_head**: Only computes logits for the final position during generation
+**Python Engine:**
+- **Correct float16 weight loading**: Fixed critical bug where HF weight keys were silently skipped (+13% on 8B, +30% on 0.6B)
+- **`mx.compile` on decode step**: Metal kernel fusion with PreAllocKVCache (+7%)
+- **N-step graph batching**: Up to 64 sequential forward passes before `mx.async_eval` (+24% on 0.6B)
+- **Compiled fused ops** / **async evaluation** / **concat KV cache**
+
+**C++ Server (from 60 → 232 tok/s = +287%):**
+- **bfloat16 KV cache**: dtype mismatch fix eliminated conversion kernels (+56%)
+- **Pre-dequantized embedding**: Was dequantizing 155M elements per token (+70%)
+- **Quantized lm_head**: `quantized_matmul` for tied embeddings (4× less bandwidth)
+- **Batched forward pass**: Same-offset requests processed in single GPU call
+- **N=32 step graph batching** + **int-offset forward** (no mx::eval sync)
+- **Weight reference caching**: Pre-resolved all array refs at construction
 
 ## Quick Start
 
