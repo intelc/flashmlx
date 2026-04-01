@@ -413,52 +413,16 @@ mx::array NemotronHModel::mamba_block(
 
     if (L == 1) {
         // Single token decode: update sliding window
-        // conv_state: [B, conv_kernel-1, conv_dim], conv_input: [B, 1, conv_dim]
-        // Shift left by 1 and append new input
-        auto shifted = mx::slice(conv_state, {0, 1, 0},
-                                 {B_dim, conv_kernel_ - 1, conv_dim_});
-        conv_state = mx::concatenate({shifted, conv_input}, 1);
-
-        // Apply depthwise conv: sum over window with weights
-        // conv1d.weight: [conv_dim, 4, 1] -> we need [conv_dim, conv_kernel]
+        // conv_state: [B, conv_kernel-1, conv_dim] stores the last k-1 conv inputs.
+        // For the convolution we need the last k inputs = concat(state, new_input).
         auto conv_w = get_weight(prefix + ".conv1d.weight");
         // conv_w shape: [conv_dim, conv_kernel, 1] -> squeeze to [conv_dim, conv_kernel]
         conv_w = mx::squeeze(conv_w, -1);  // [conv_dim, conv_kernel]
 
-        // conv_state: [B, conv_kernel, conv_dim] (after concat, it's conv_kernel-1+1=conv_kernel wide)
-        // But we have conv_kernel-1 entries + 1 = conv_kernel entries now.
-        // Wait: conv_state starts as [B, conv_kernel-1, conv_dim].
-        // After shifting: we take [B, 1:conv_kernel-1, conv_dim] = [B, conv_kernel-2, conv_dim]
-        // Then concat with [B, 1, conv_dim] = [B, conv_kernel-1, conv_dim]
-        // That's still conv_kernel-1! We need conv_kernel values for the full convolution.
-        // Actually: the full window is conv_state (which includes the current input now).
-        // We concatenate the shifted state with the new input: [B, conv_kernel-1, conv_dim]
-        // The convolution needs the last conv_kernel values. With conv_kernel=4,
-        // we store 3 previous + current input.
-        // But we shifted from [B, 3, conv_dim] -> slice [B, 1:3] = [B, 2, conv_dim]
-        //   then concat with [B, 1] = [B, 3, conv_dim].
-        // So conv_state always has conv_kernel-1 entries. For the conv, the window is
-        // all conv_kernel-1 entries = {t-2, t-1, t_new}... but we need 4 values for kernel size 4!
-        //
-        // Fix: conv_state should be [B, conv_kernel, conv_dim] and we take the full window.
-        // Actually let me reconsider. Standard approach:
-        // conv_state = [B, conv_kernel-1, conv_dim] initially (stores last k-1 inputs)
-        // new_state = concat(conv_state[:, 1:, :], new_input) = [B, conv_kernel-1, conv_dim]
-        //   This holds the last conv_kernel-1 inputs: {t-(k-2), ..., t-1, t_current}
-        //   But we need conv_kernel inputs for conv! So we should store conv_kernel, not conv_kernel-1.
+        // Build full convolution window: [B, conv_kernel, conv_dim]
+        auto full_window = mx::concatenate({conv_state, conv_input}, 1);
 
-        // Let me re-do: store conv_state as [B, conv_kernel, conv_dim].
-        // The current approach already stores [B, conv_kernel-1, conv_dim].
-        // For a kernel of size 4, we need t-3, t-2, t-1, t_current (4 values).
-        // State stores t-3, t-2, t-1 (3 values). Then we need all 4 = concat(state, new_input):
-
-        // Re-do: don't shift, just build full window
-        auto full_window = mx::concatenate({
-            mx::slice(conv_state, {0, 0, 0}, {B_dim, conv_kernel_ - 1, conv_dim_}),
-            conv_input
-        }, 1);  // [B, conv_kernel, conv_dim]
-
-        // Update state: drop oldest, keep last conv_kernel-1
+        // Update state: drop oldest, keep last conv_kernel-1 for next step
         conv_state = mx::slice(full_window, {0, 1, 0}, {B_dim, conv_kernel_, conv_dim_});
 
         // Depthwise conv: element-wise multiply and sum over kernel dimension
