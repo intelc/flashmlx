@@ -1,6 +1,7 @@
 # MLX Optimization Notes
 
-Lessons learned from 25 autoresearch iterations optimizing FlashMLX on Apple M1 Max.
+Lessons learned from autoresearch iterations optimizing FlashMLX on Apple M1 Max.
+Covers Python engine (25 iterations), 8B optimization (19 iterations), and C++ batched server.
 
 ## What Worked
 
