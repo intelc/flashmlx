@@ -143,8 +143,10 @@ mx::array BatchKVCache::get_values_plus1(int layer) const {
 
 mx::array BatchKVCache::get_mask() const {
     if (!valid_) throw std::runtime_error("BatchKVCache::get_mask: cache not valid");
+    // Return write_pos+1 entries — includes the valid position for the new token
+    // so attention doesn't need to concat a valid column each step
     return mx::slice(*mask_, {0, 0, 0, 0},
-                     {batch_size_, 1, 1, write_pos_});
+                     {batch_size_, 1, 1, write_pos_ + 1});
 }
 
 mx::array BatchKVCache::get_rope_offsets() const {

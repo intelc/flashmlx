@@ -1191,14 +1191,13 @@ mx::array LlamaModel::forward_batched_inplace(
             cache.update(k, v, i);
 
             // SDPA on full cache [0:write_pos+1] — includes new token
+            // mask already has write_pos+1 entries from get_mask()
             auto full_k = cache.get_keys_plus1(i);
             auto full_v = cache.get_values_plus1(i);
-            auto valid_col = mx::zeros({B, 1, 1, 1}, mask.dtype());
-            auto full_mask = mx::concatenate({mask, valid_col}, 3);
 
             float scale = 1.0f / std::sqrt(static_cast<float>(hd));
             auto attn_out = mx::fast::scaled_dot_product_attention(
-                q, full_k, full_v, scale, "", full_mask);
+                q, full_k, full_v, scale, "", mask);
             attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
             h = mx::add(h, linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b));
         }
