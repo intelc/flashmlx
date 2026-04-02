@@ -11,3 +11,5 @@ server/build/
 .DS_Store
 models/
 autoresearch-results.tsv
+autoresearch-results.tsv
+vllm-mlx-fork/
