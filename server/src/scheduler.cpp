@@ -64,8 +64,23 @@ std::unordered_map<std::string, std::vector<int>> BatchScheduler::step() {
             done_ids.push_back(decoding_ids[0]);
         }
     } else if (decoding_ids.size() > 1) {
-        // Multiple requests — heterogeneous batched decode
-        decode_batch_heterogeneous(decoding_ids, new_tokens, done_ids);
+        // Check if all requests share the same offset — use fast homogeneous path
+        bool all_same_offset = true;
+        int first_offset = active_[decoding_ids[0]].cache_offset;
+        for (size_t i = 1; i < decoding_ids.size(); i++) {
+            if (active_[decoding_ids[i]].cache_offset != first_offset) {
+                all_same_offset = false;
+                break;
+            }
+        }
+
+        if (all_same_offset) {
+            // Homogeneous: all at same offset — use fast int-offset concat path
+            decode_batch(decoding_ids, new_tokens, done_ids);
+        } else {
+            // Heterogeneous: different offsets — use scatter + mask path
+            decode_batch_heterogeneous(decoding_ids, new_tokens, done_ids);
+        }
     }
 
     // 3. Cleanup completed requests
@@ -361,6 +376,10 @@ void BatchScheduler::decode_batch(
 
     int B = static_cast<int>(ids.size());
     int num_layers = pool_.num_layers();
+    int n_kv = model_.config().num_key_value_heads;
+    int hd = model_.config().head_dim > 0 ? model_.config().head_dim
+             : model_.config().hidden_size / model_.config().num_attention_heads;
+    int max_ctx = pool_.max_context_len();
 
     // 1. Build batched input_ids [B, 1]
     std::vector<int> tok_ids;
@@ -370,9 +389,10 @@ void BatchScheduler::decode_batch(
     }
     auto input_ids = mx::array(tok_ids.data(), {B, 1}, mx::int32);
 
-    // 2. Build batched KV caches by concatenating slots along batch dim
-    //    Each slot is [1, n_kv_heads, max_ctx, hd]
-    //    Concatenated: [B, n_kv_heads, max_ctx, hd]
+    // All requests share the same offset
+    int offset = active_[ids[0]].cache_offset;
+
+    // 2. Build batched KV caches — slice to effective length for concat-based forward
     std::vector<mx::array> batch_cache_k, batch_cache_v;
     batch_cache_k.reserve(num_layers);
     batch_cache_v.reserve(num_layers);
@@ -381,45 +401,44 @@ void BatchScheduler::decode_batch(
         std::vector<mx::array> k_parts, v_parts;
         for (auto& id : ids) {
             int slot = active_[id].kv_slot;
-            k_parts.push_back(pool_.keys(slot, l));
-            v_parts.push_back(pool_.values(slot, l));
+            k_parts.push_back(mx::slice(pool_.keys(slot, l),
+                {0, 0, 0, 0}, {1, n_kv, offset, hd}));
+            v_parts.push_back(mx::slice(pool_.values(slot, l),
+                {0, 0, 0, 0}, {1, n_kv, offset, hd}));
         }
         batch_cache_k.push_back(mx::concatenate(k_parts, 0));
         batch_cache_v.push_back(mx::concatenate(v_parts, 0));
     }
 
-    // 3. All requests in the group share the same cache offset by construction.
-    std::vector<int> offsets;
-    for (auto& id : ids) {
-        offsets.push_back(active_[id].cache_offset);
-    }
+    // 3. Single batched forward pass (concat-based, no mask needed)
+    mx::array logits = model_.forward(input_ids, batch_cache_k, batch_cache_v, offset);
 
-    // 4. Single batched forward pass through the homogeneous decode path.
-    mx::array logits = model_.forward(input_ids, batch_cache_k, batch_cache_v, offsets[0]);
-
-    // 5. Split KV caches back to individual slots
+    // 4. Write grown caches back to pool (concat grew from offset to offset+1)
+    int new_len = offset + 1;
     for (int l = 0; l < num_layers; l++) {
         for (int b = 0; b < B; b++) {
             int slot = active_[ids[b]].kv_slot;
-            pool_.keys(slot, l) = mx::slice(batch_cache_k[l], {b, 0, 0, 0},
-                {b + 1, batch_cache_k[l].shape(1), batch_cache_k[l].shape(2), batch_cache_k[l].shape(3)});
-            pool_.values(slot, l) = mx::slice(batch_cache_v[l], {b, 0, 0, 0},
-                {b + 1, batch_cache_v[l].shape(1), batch_cache_v[l].shape(2), batch_cache_v[l].shape(3)});
+            auto slice_k = mx::slice(batch_cache_k[l], {b, 0, 0, 0},
+                {b + 1, n_kv, new_len, hd});
+            auto slice_v = mx::slice(batch_cache_v[l], {b, 0, 0, 0},
+                {b + 1, n_kv, new_len, hd});
+            pool_.keys(slot, l) = mx::slice_update(pool_.keys(slot, l), slice_k,
+                {0, 0, 0, 0}, {1, n_kv, new_len, hd});
+            pool_.values(slot, l) = mx::slice_update(pool_.values(slot, l), slice_v,
+                {0, 0, 0, 0}, {1, n_kv, new_len, hd});
         }
     }
 
-    // 6. Sample tokens per-request
-    //    logits shape: [B, 1, vocab_size]
+    // 5. Batch sample all tokens at once
+    auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
+    auto all_tokens = mx::argmax(all_logits, -1);
+    mx::eval({all_tokens});
+
     for (int b = 0; b < B; b++) {
         auto& req = active_[ids[b]];
-        auto req_logits = mx::slice(logits, {b, 0, 0}, {b + 1, 1, logits.shape(2)});
-        req_logits = mx::reshape(req_logits, {1, -1});
+        int tok_id = mx::slice(all_tokens, {b}, {b + 1}).item<int>();
 
-        mx::array token = sample_token(req_logits, req.temperature);
-        mx::eval({token});
-        int tok_id = token.item<int>();
-
-        req.next_token = token;
+        req.next_token = mx::array({tok_id}, mx::int32);
         req.output_tokens.push_back(tok_id);
         req.generated_count++;
         req.cache_offset++;
