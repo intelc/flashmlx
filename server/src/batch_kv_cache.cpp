@@ -87,6 +87,15 @@ void BatchKVCache::build(
     to_eval.push_back(*mask_);
 
     mx::eval(to_eval);
+    // Check if all sequences have the same left padding
+    uniform_padding_ = true;
+    for (int b = 1; b < batch_size_; b++) {
+        if (left_padding_[b] != left_padding_[0]) {
+            uniform_padding_ = false;
+            break;
+        }
+    }
+
     valid_ = true;
 }
 

@@ -1099,13 +1099,17 @@ std::tuple<mx::array, mx::array, mx::array> LlamaModel::attention_batched(
     auto full_k = mx::concatenate({cache_k, k}, 2);  // [B, n_kv, write_pos+1, hd]
     auto full_v = mx::concatenate({cache_v, v}, 2);
 
-    // Extend mask by 1 column for the new token (always valid = 0.0)
-    auto valid_col = mx::zeros({B, 1, 1, 1}, mask.dtype());
-    auto full_mask = mx::concatenate({mask, valid_col}, 3);  // [B, 1, 1, write_pos+1]
-
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    auto attn_out = mx::fast::scaled_dot_product_attention(
-        q, full_k, full_v, scale, /*mask_mode=*/"", /*mask=*/full_mask);
+    auto attn_out = [&]() -> mx::array {
+        if (mask.ndim() == 0) {
+            // No mask (uniform zero padding — all positions valid)
+            return mx::fast::scaled_dot_product_attention(q, full_k, full_v, scale);
+        }
+        auto valid_col = mx::zeros({B, 1, 1, 1}, mask.dtype());
+        auto full_mask = mx::concatenate({mask, valid_col}, 3);
+        return mx::fast::scaled_dot_product_attention(
+            q, full_k, full_v, scale, /*mask_mode=*/"", /*mask=*/full_mask);
+    }();
 
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
     auto output = linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b);
