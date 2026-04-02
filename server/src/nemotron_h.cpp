@@ -1522,7 +1522,12 @@ mx::array NemotronHModel::compiled_decode(
                         case BlockType::MOE: {
                             auto& mw = *self.moe_layer_weights_[i];
                             auto normed = self.rms_norm(h, *mw.norm_w);
-                            block_out = self.moe_block(normed, i);
+                            // Use compiled MoE mixer for kernel fusion
+                            if (self.compiled_moe_mixers_initialized_ && self.compiled_moe_mixers_[i]) {
+                                block_out = self.compiled_moe_mixers_[i]({normed})[0];
+                            } else {
+                                block_out = self.moe_block(normed, i);
+                            }
                             break;
                         }
                     }
@@ -1640,7 +1645,7 @@ mx::array NemotronHModel::forward(
         init_compiled_moe_mixers();
     }
 
-    // Direct forward with compiled MoE mixers for kernel fusion
+    // Direct forward with per-layer compiled MoE mixers (best for Nemotron-30B)
     auto h = embed(input_ids);
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
@@ -1666,7 +1671,12 @@ mx::array NemotronHModel::forward(
                 break;
             }
             case BlockType::MOE: {
-                block_out = moe_block(normed, i);
+                // Use compiled MoE mixer for kernel fusion (elementwise ops fused)
+                if (compiled_moe_mixers_initialized_ && compiled_moe_mixers_[i]) {
+                    block_out = compiled_moe_mixers_[i]({normed})[0];
+                } else {
+                    block_out = moe_block(normed, i);
+                }
                 break;
             }
         }
