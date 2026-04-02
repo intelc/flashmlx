@@ -137,10 +137,14 @@ void Engine::loop() {
         // Check for completed requests
         auto completed = scheduler_->drain_completed();
         if (!completed.empty()) {
-            std::lock_guard<std::mutex> lock(output_mutex_);
-            for (const auto& req_id : completed) {
-                output_queue_.push(TokenOutput{req_id, {}, true});
+            {
+                std::lock_guard<std::mutex> lock(output_mutex_);
+                for (const auto& req_id : completed) {
+                    output_queue_.push(TokenOutput{req_id, {}, true});
+                }
             }
+            // Free Metal command buffer cache after completing requests
+            mx::clear_cache();
         }
     }
 }
