@@ -64,8 +64,8 @@ std::unordered_map<std::string, std::vector<int>> BatchScheduler::step() {
             done_ids.push_back(decoding_ids[0]);
         }
     } else if (decoding_ids.size() > 1) {
-        // Multiple requests — heterogeneous batched decode
-        decode_batch_heterogeneous(decoding_ids, new_tokens, done_ids);
+        // Multiple requests — batched decode with left-padded KV cache
+        decode_batched(decoding_ids, new_tokens, done_ids);
     }
 
     // 3. Cleanup completed requests
@@ -460,28 +460,20 @@ void BatchScheduler::decode_batch_heterogeneous(
     auto offsets = mx::array(offset_vec.data(), {B}, mx::int32);
     int max_kv_len = max_offset + 1;
 
-    // 2. Check if persistent batch cache is valid (same set of IDs, same order)
-    bool cache_hit = batch_cache_valid_ && (ids == batch_ids_);
+    // 2. Build batched KV caches from pool slots (no persistent caching)
+    std::vector<mx::array> batch_cache_k, batch_cache_v;
+    batch_cache_k.reserve(num_layers);
+    batch_cache_v.reserve(num_layers);
 
-    if (!cache_hit) {
-        // Rebuild batched KV caches from pool slots
-        batch_cache_k_.clear();
-        batch_cache_v_.clear();
-        batch_cache_k_.reserve(num_layers);
-        batch_cache_v_.reserve(num_layers);
-
-        for (int l = 0; l < num_layers; l++) {
-            std::vector<mx::array> k_parts, v_parts;
-            for (auto& id : ids) {
-                int slot = active_[id].kv_slot;
-                k_parts.push_back(pool_.keys(slot, l));
-                v_parts.push_back(pool_.values(slot, l));
-            }
-            batch_cache_k_.push_back(mx::concatenate(k_parts, 0));
-            batch_cache_v_.push_back(mx::concatenate(v_parts, 0));
+    for (int l = 0; l < num_layers; l++) {
+        std::vector<mx::array> k_parts, v_parts;
+        for (auto& id : ids) {
+            int slot = active_[id].kv_slot;
+            k_parts.push_back(pool_.keys(slot, l));
+            v_parts.push_back(pool_.values(slot, l));
         }
-        batch_ids_ = ids;
-        batch_cache_valid_ = true;
+        batch_cache_k.push_back(mx::concatenate(k_parts, 0));
+        batch_cache_v.push_back(mx::concatenate(v_parts, 0));
     }
 
     // 3. Slice to effective length for this step
@@ -489,27 +481,112 @@ void BatchScheduler::decode_batch_heterogeneous(
     step_cache_k.reserve(num_layers);
     step_cache_v.reserve(num_layers);
     for (int l = 0; l < num_layers; l++) {
-        step_cache_k.push_back(mx::slice(batch_cache_k_[l],
+        step_cache_k.push_back(mx::slice(batch_cache_k[l],
             {0, 0, 0, 0}, {B, n_kv, max_kv_len, hd}));
-        step_cache_v.push_back(mx::slice(batch_cache_v_[l],
+        step_cache_v.push_back(mx::slice(batch_cache_v[l],
             {0, 0, 0, 0}, {B, n_kv, max_kv_len, hd}));
     }
 
     // 4. Heterogeneous forward pass (modifies step_cache via put_along_axis)
     mx::array logits = model_.forward_heterogeneous(input_ids, step_cache_k, step_cache_v, offsets, max_kv_len);
 
-    // 5. Write updated caches back to persistent batch cache
-    //    forward_heterogeneous grew caches by 1 token via scatter
+    // 5. Split KV caches back to individual slots
     for (int l = 0; l < num_layers; l++) {
-        int new_len = step_cache_k[l].shape(2);
-        batch_cache_k_[l] = mx::slice_update(batch_cache_k_[l], step_cache_k[l],
-            {0, 0, 0, 0}, {B, n_kv, new_len, hd});
-        batch_cache_v_[l] = mx::slice_update(batch_cache_v_[l], step_cache_v[l],
-            {0, 0, 0, 0}, {B, n_kv, new_len, hd});
+        for (int b = 0; b < B; b++) {
+            int slot = active_[ids[b]].kv_slot;
+            pool_.keys(slot, l) = mx::slice(step_cache_k[l], {b, 0, 0, 0},
+                {b + 1, n_kv, step_cache_k[l].shape(2), hd});
+            pool_.values(slot, l) = mx::slice(step_cache_v[l], {b, 0, 0, 0},
+                {b + 1, n_kv, step_cache_v[l].shape(2), hd});
+        }
     }
 
     // 6. Sample all tokens at once
     auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
+    auto all_tokens = mx::argmax(all_logits, -1);
+    mx::eval({all_tokens});
+
+    for (int b = 0; b < B; b++) {
+        auto& req = active_[ids[b]];
+        int tok_id = mx::slice(all_tokens, {b}, {b + 1}).item<int>();
+
+        req.next_token = mx::array({tok_id}, mx::int32);
+        req.output_tokens.push_back(tok_id);
+        req.generated_count++;
+        req.cache_offset++;
+
+        new_tokens[ids[b]].push_back(tok_id);
+
+        if (req.generated_count >= req.max_tokens) {
+            req.state = RequestState::DONE;
+            done_ids.push_back(ids[b]);
+        }
+    }
+}
+
+void BatchScheduler::decode_batched(
+    const std::vector<std::string>& ids,
+    std::unordered_map<std::string, std::vector<int>>& new_tokens,
+    std::vector<std::string>& done_ids) {
+
+    int B = static_cast<int>(ids.size());
+    int num_layers = pool_.num_layers();
+    int n_kv = model_.config().num_key_value_heads;
+    int hd = model_.config().head_dim > 0 ? model_.config().head_dim
+             : model_.config().hidden_size / model_.config().num_attention_heads;
+
+    // 1. Build input tokens [B, 1]
+    std::vector<int> tok_ids;
+    tok_ids.reserve(B);
+    for (auto& id : ids) {
+        tok_ids.push_back(active_[id].next_token.item<int>());
+    }
+    auto input_ids = mx::array(tok_ids.data(), {B, 1}, mx::int32);
+
+    // 2. Build or reuse BatchKVCache
+    if (!batch_kv_cache_.valid() || ids != batch_ids_) {
+        // Build from pool slots
+        std::vector<std::vector<mx::array>> slot_keys(B), slot_values(B);
+        std::vector<int> seq_lengths(B);
+        for (int b = 0; b < B; b++) {
+            auto& req = active_[ids[b]];
+            seq_lengths[b] = req.cache_offset;
+            slot_keys[b].reserve(num_layers);
+            slot_values[b].reserve(num_layers);
+            for (int l = 0; l < num_layers; l++) {
+                slot_keys[b].push_back(mx::slice(pool_.keys(req.kv_slot, l),
+                    {0, 0, 0, 0}, {1, n_kv, req.cache_offset, hd}));
+                slot_values[b].push_back(mx::slice(pool_.values(req.kv_slot, l),
+                    {0, 0, 0, 0}, {1, n_kv, req.cache_offset, hd}));
+            }
+        }
+        batch_kv_cache_.build(slot_keys, slot_values, seq_lengths,
+                              num_layers, n_kv, hd, model_.config().activation_dtype);
+        batch_ids_ = ids;
+    }
+
+    // 3. Get cache state
+    std::vector<mx::array> cache_k, cache_v;
+    cache_k.reserve(num_layers);
+    cache_v.reserve(num_layers);
+    for (int l = 0; l < num_layers; l++) {
+        cache_k.push_back(batch_kv_cache_.get_keys(l));
+        cache_v.push_back(batch_kv_cache_.get_values(l));
+    }
+    auto rope_offsets = batch_kv_cache_.get_rope_offsets();
+    auto mask = batch_kv_cache_.get_mask();
+
+    // 4. Forward pass
+    auto result = model_.forward_batched(input_ids, cache_k, cache_v, rope_offsets, mask);
+
+    // 5. Write new K/V to cache and advance
+    for (int l = 0; l < num_layers; l++) {
+        batch_kv_cache_.update(result.new_keys[l], result.new_values[l], l);
+    }
+    batch_kv_cache_.advance();
+
+    // 6. Sample all tokens at once
+    auto all_logits = mx::reshape(result.logits, {B, result.logits.shape(2)});
     auto all_tokens = mx::argmax(all_logits, -1);
     mx::eval({all_tokens});
 
@@ -532,22 +609,24 @@ void BatchScheduler::decode_batch_heterogeneous(
         }
     }
 
-    // If any request completed, invalidate batch cache
-    // (next step will have different set of IDs)
+    // 7. If any request completed, flush caches back to pool and invalidate
     if (any_done) {
-        // Flush batched caches back to pool slots before invalidation
-        for (int l = 0; l < num_layers; l++) {
-            for (int b = 0; b < B; b++) {
-                int slot = active_[ids[b]].kv_slot;
-                pool_.keys(slot, l) = mx::slice(batch_cache_k_[l], {b, 0, 0, 0},
-                    {b + 1, n_kv, batch_cache_k_[l].shape(2), hd});
-                pool_.values(slot, l) = mx::slice(batch_cache_v_[l], {b, 0, 0, 0},
-                    {b + 1, n_kv, batch_cache_v_[l].shape(2), hd});
+        std::vector<std::vector<mx::array>> flush_keys, flush_values;
+        batch_kv_cache_.flush_to_slots(flush_keys, flush_values);
+        int max_ctx = pool_.max_context_len();
+        for (int b = 0; b < B; b++) {
+            int slot = active_[ids[b]].kv_slot;
+            for (int l = 0; l < num_layers; l++) {
+                int len = flush_keys[b][l].shape(2);
+                auto full = mx::zeros({1, n_kv, max_ctx, hd}, model_.config().activation_dtype);
+                pool_.keys(slot, l) = mx::slice_update(full, flush_keys[b][l],
+                    {0, 0, 0, 0}, {1, n_kv, len, hd});
+                full = mx::zeros({1, n_kv, max_ctx, hd}, model_.config().activation_dtype);
+                pool_.values(slot, l) = mx::slice_update(full, flush_values[b][l],
+                    {0, 0, 0, 0}, {1, n_kv, len, hd});
             }
         }
-        batch_cache_valid_ = false;
-        batch_cache_k_.clear();
-        batch_cache_v_.clear();
+        batch_kv_cache_.invalidate();
         batch_ids_.clear();
     }
 }

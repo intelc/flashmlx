@@ -8,6 +8,7 @@
 
 #include <mlx/mlx.h>
 
+#include "flashmlx/batch_kv_cache.h"
 #include "flashmlx/kv_pool.h"
 #include "flashmlx/model.h"
 #include "flashmlx/sampling.h"
@@ -62,6 +63,9 @@ private:
     void decode_batch_heterogeneous(const std::vector<std::string>& ids,
                                     std::unordered_map<std::string, std::vector<int>>& new_tokens,
                                     std::vector<std::string>& done_ids);
+    void decode_batched(const std::vector<std::string>& ids,
+                        std::unordered_map<std::string, std::vector<int>>& new_tokens,
+                        std::vector<std::string>& done_ids);
 
 
     // Prefix cache: hash of prompt tokens -> pre-computed KV data
@@ -78,12 +82,9 @@ private:
     ModelBase& model_;
     KVCachePool& pool_;
 
-    // Persistent batched KV caches for heterogeneous decode
-    // Avoids per-step concat/split when the same set of requests is active
-    std::vector<mx::array> batch_cache_k_;  // [B, n_kv, max_kv_len, hd] per layer
-    std::vector<mx::array> batch_cache_v_;
-    std::vector<std::string> batch_ids_;    // request IDs in current batch
-    bool batch_cache_valid_ = false;
+    // Left-padded batched KV cache for multi-request decode
+    BatchKVCache batch_kv_cache_;
+    std::vector<std::string> batch_ids_;
 
     // Pending queue — accessed from submit() (Python thread) and step() (C++ thread)
     std::deque<Request> pending_;
