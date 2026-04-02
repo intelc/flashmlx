@@ -566,10 +566,10 @@ void BatchScheduler::decode_batched(
     }
 
     // 3. Forward pass with in-place cache updates (enables buffer donation)
+    //    Views are created and released per-layer inside the forward pass,
+    //    so the cache buffer refcount is 1 when slice_update runs.
     auto rope_offsets = batch_kv_cache_.get_rope_offsets();
-    // Skip mask when all sequences have same zero padding (same prefix-cached prompt)
-    auto mask = (batch_kv_cache_.uniform_padding()) ?
-        mx::array(0) : batch_kv_cache_.get_mask();
+    auto mask = batch_kv_cache_.get_mask();
     auto logits = model_.forward_batched_inplace(input_ids, batch_kv_cache_, rope_offsets, mask);
     batch_kv_cache_.advance();
 

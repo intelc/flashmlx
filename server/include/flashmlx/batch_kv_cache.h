@@ -50,8 +50,6 @@ public:
     int write_pos() const { return write_pos_; }
     bool valid() const { return valid_; }
     void invalidate() { valid_ = false; }
-    /// True if all sequences have the same left padding (e.g., same prompt via prefix cache)
-    bool uniform_padding() const { return uniform_padding_; }
 
 private:
     void grow_buffers();
@@ -75,7 +73,6 @@ private:
     std::optional<mx::array> mask_;
 
     bool valid_ = false;
-    bool uniform_padding_ = false;  // true if all sequences have same left_padding
 };
 
 } // namespace flashmlx
