@@ -1,4 +1,5 @@
 #include "flashmlx/model.h"
+#include "flashmlx/batch_kv_cache.h"
 #include <mlx/compile.h>
 
 #include <fstream>
@@ -1150,6 +1151,49 @@ ModelBase::BatchedForwardResult LlamaModel::forward_batched(
     auto logits = lm_head(h);
 
     return {logits, std::move(all_new_keys), std::move(all_new_values)};
+}
+
+mx::array LlamaModel::forward_batched_inplace(
+    const mx::array& input_ids,
+    BatchKVCache& cache,
+    const mx::array& rope_offsets,
+    const mx::array& mask) {
+
+    auto h = embed(input_ids);
+
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        const auto& lw = layer_weights_[i];
+        auto normed = rms_norm(h, lw.input_norm_w);
+
+        // Get cache view, run attention, update cache, release view — per layer.
+        // Scoping ensures views are dead before next layer's update,
+        // enabling buffer donation (in-place Metal writes).
+        {
+            auto ck = cache.get_keys(i);
+            auto cv = cache.get_values(i);
+            auto [attn_out_inner, new_k, new_v] = attention_batched(
+                normed, i, ck, cv, rope_offsets, mask);
+            h = mx::add(h, attn_out_inner);
+            // ck, cv go out of scope after this block — but we need to update first.
+            // Move them to release the view reference before update.
+            ck = mx::array(0);  // release view
+            cv = mx::array(0);
+            cache.update(new_k, new_v, i);
+        }
+
+        auto normed2 = rms_norm(h, lw.post_norm_w);
+        auto mlp_out = [&]() -> mx::array {
+            if (!layer_is_moe_.empty() && i < (int)layer_is_moe_.size() && layer_is_moe_[i]) {
+                return moe_block(normed2, i);
+            } else {
+                return mlp_fast(normed2, i);
+            }
+        }();
+        h = mx::add(h, mlp_out);
+    }
+
+    h = rms_norm(h, *norm_w_);
+    return lm_head(h);
 }
 
 // ---------------------------------------------------------------------------

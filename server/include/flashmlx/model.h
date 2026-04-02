@@ -14,6 +14,9 @@ namespace mx = mlx::core;
 
 namespace flashmlx {
 
+// Forward declaration
+class BatchKVCache;
+
 struct ModelConfig {
     int hidden_size = 4096;
     int intermediate_size = 14336;
@@ -110,6 +113,14 @@ public:
         const mx::array& rope_offsets,               // [B] per-sequence RoPE offsets
         const mx::array& mask) = 0;                  // [B, 1, 1, seq_len] attention mask
 
+    /// In-place batched forward: updates BatchKVCache layer-by-layer during forward pass.
+    /// Views are released before cache update, enabling buffer donation (in-place Metal writes).
+    virtual mx::array forward_batched_inplace(
+        const mx::array& input_ids,
+        BatchKVCache& cache,
+        const mx::array& rope_offsets,
+        const mx::array& mask) = 0;
+
     virtual const ModelConfig& config() const = 0;
     virtual std::vector<int> debug_forward(const std::vector<int>& token_ids) = 0;
     virtual std::vector<float> debug_embed(const std::vector<int>& token_ids) = 0;
@@ -147,6 +158,13 @@ public:
         const mx::array& input_ids,
         const std::vector<mx::array>& cache_keys,
         const std::vector<mx::array>& cache_values,
+        const mx::array& rope_offsets,
+        const mx::array& mask) override;
+
+    /// In-place batched forward: updates cache layer-by-layer for buffer donation.
+    mx::array forward_batched_inplace(
+        const mx::array& input_ids,
+        BatchKVCache& cache,
         const mx::array& rope_offsets,
         const mx::array& mask) override;
 
@@ -277,6 +295,12 @@ public:
         const mx::array& input_ids,
         const std::vector<mx::array>& cache_keys,
         const std::vector<mx::array>& cache_values,
+        const mx::array& rope_offsets,
+        const mx::array& mask) override;
+
+    mx::array forward_batched_inplace(
+        const mx::array& input_ids,
+        BatchKVCache& cache,
         const mx::array& rope_offsets,
         const mx::array& mask) override;
 

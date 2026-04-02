@@ -1,5 +1,6 @@
 #include "flashmlx/batch_kv_cache.h"
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 namespace flashmlx {
@@ -94,8 +95,7 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
     if (layer < 0 || layer >= num_layers_) throw std::out_of_range("BatchKVCache::update: bad layer");
 
     // k, v: [B, n_kv, 1, hd]
-    // Write at write_pos_ — move old array out to enable buffer donation (in-place write)
-    // When the source array has refcount==1, MLX reuses the buffer instead of allocating new memory
+    // slice_update with std::move for buffer donation
     auto old_k = std::move(*keys_[layer]);
     keys_[layer] = mx::slice_update(old_k, k,
         {0, 0, write_pos_, 0},
@@ -105,8 +105,7 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
         {0, 0, write_pos_, 0},
         {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
 
-    // Periodic eval as safety net — flattens graph if donation didn't fully apply
-    // (e.g., when get_keys/get_values create views sharing the buffer)
+    // Periodic eval every 16 steps to flatten graph depth
     if (layer == num_layers_ - 1 && write_pos_ > 0 && write_pos_ % 16 == 0) {
         std::vector<mx::array> to_eval;
         to_eval.reserve(num_layers_ * 2);

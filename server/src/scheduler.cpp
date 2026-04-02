@@ -565,28 +565,16 @@ void BatchScheduler::decode_batched(
         batch_ids_ = ids;
     }
 
-    // 3. Get cache state
-    std::vector<mx::array> cache_k, cache_v;
-    cache_k.reserve(num_layers);
-    cache_v.reserve(num_layers);
-    for (int l = 0; l < num_layers; l++) {
-        cache_k.push_back(batch_kv_cache_.get_keys(l));
-        cache_v.push_back(batch_kv_cache_.get_values(l));
-    }
+    // 3. Forward pass with in-place cache updates (enables buffer donation)
+    //    Views are created and released per-layer inside the forward pass,
+    //    so the cache buffer refcount is 1 when slice_update runs.
     auto rope_offsets = batch_kv_cache_.get_rope_offsets();
     auto mask = batch_kv_cache_.get_mask();
-
-    // 4. Forward pass
-    auto result = model_.forward_batched(input_ids, cache_k, cache_v, rope_offsets, mask);
-
-    // 5. Write new K/V to cache and advance
-    for (int l = 0; l < num_layers; l++) {
-        batch_kv_cache_.update(result.new_keys[l], result.new_values[l], l);
-    }
+    auto logits = model_.forward_batched_inplace(input_ids, batch_kv_cache_, rope_offsets, mask);
     batch_kv_cache_.advance();
 
-    // 6. Sample all tokens at once
-    auto all_logits = mx::reshape(result.logits, {B, result.logits.shape(2)});
+    // 4. Sample all tokens at once
+    auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
     auto all_tokens = mx::argmax(all_logits, -1);
     mx::eval({all_tokens});
 

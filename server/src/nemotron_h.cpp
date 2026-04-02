@@ -1,4 +1,5 @@
 #include "flashmlx/model.h"
+#include "flashmlx/batch_kv_cache.h"
 #include <mlx/compile.h>
 
 #include <fstream>
@@ -1789,6 +1790,14 @@ ModelBase::BatchedForwardResult NemotronHModel::forward_batched(
     const mx::array& /*rope_offsets*/,
     const mx::array& /*mask*/) {
     throw std::runtime_error("NemotronHModel does not support forward_batched");
+}
+
+mx::array NemotronHModel::forward_batched_inplace(
+    const mx::array& /*input_ids*/,
+    BatchKVCache& /*cache*/,
+    const mx::array& /*rope_offsets*/,
+    const mx::array& /*mask*/) {
+    throw std::runtime_error("NemotronHModel does not support forward_batched_inplace");
 }
 
 // ---------------------------------------------------------------------------
