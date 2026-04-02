@@ -214,6 +214,12 @@ public:
     std::vector<mx::array>& mamba_conv_states() { return mamba_conv_states_; }
     std::vector<mx::array>& mamba_ssm_states() { return mamba_ssm_states_; }
 
+    /// Benchmark helpers: per-block forward
+    mx::array embed_for_benchmark(const mx::array& input_ids);
+    mx::array forward_one_block(mx::array& h, int i,
+        std::vector<mx::array>& cache_k, std::vector<mx::array>& cache_v, int offset);
+    int block_type_int(int i) const;
+
 private:
     void load_config(const std::string& model_path);
     void load_weights(const std::string& model_path);
@@ -342,9 +348,11 @@ private:
     void build_weight_cache();
     bool weight_cache_built_ = false;
 
-    // Compiled MoE routing function (for n_group=1 fast path)
-    std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_moe_route_;
-    bool compiled_moe_route_initialized_ = false;
+    // Per-layer compiled MoE functions: {x} -> {output}
+    // Each captures the layer's weights as constants for fusion
+    std::vector<std::function<std::vector<mx::array>(const std::vector<mx::array>&)>> compiled_moe_mixers_;
+    bool compiled_moe_mixers_initialized_ = false;
+    void init_compiled_moe_mixers();
 
     // Fast linear using pre-resolved weights (no hash lookup)
     mx::array linear_fast(const mx::array& x, const mx::array& w, const mx::array& s,

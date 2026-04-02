@@ -1097,9 +1097,9 @@ mx::array NemotronHModel::moe_block(const mx::array& x, int layer) {
         return mx::squeeze(unsorted_h, -2);  // [B, L, k, hidden]
     }();
 
-    // 4. Weighted sum
+    // 4. Weighted sum — cast back to model dtype (prevents float32 infection from sigmoid scores)
     auto y = mx::multiply(h, mx::expand_dims(topk_scores, -1));
-    y = mx::sum(y, -2);  // [B, L, hidden]
+    y = mx::astype(mx::sum(y, -2), x.dtype());  // [B, L, hidden]
 
     // 5. Shared expert (use cached weights)
     if (w.has_shared_expert) {
@@ -1315,6 +1315,97 @@ void NemotronHModel::init_compiled_mamba_mixers() {
     compiled_mamba_mixers_initialized_ = true;
     std::cout << "[NemotronH] Compiled " << num_mamba_layers_
               << " mamba mixer functions (with weight cache)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Compiled per-MoE-layer mixer functions
+// Each compiled function: {x} -> {output}
+// Captures all layer weights as constants for kernel fusion
+// ---------------------------------------------------------------------------
+
+void NemotronHModel::init_compiled_moe_mixers() {
+    if (!weight_cache_built_) {
+        build_weight_cache();
+    }
+
+    compiled_moe_mixers_.clear();
+    compiled_moe_mixers_.resize(config_.num_hidden_layers);
+
+    int k = config_.num_experts_per_tok;
+    int gs = config_.quant_group_size;
+    int bits = config_.quant_bits;
+    float scale_factor = config_.routed_scaling_factor;
+    bool do_norm = config_.norm_topk_prob;
+    int n_group = config_.n_group;
+
+    int num_moe = 0;
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        if (block_types_[i] != BlockType::MOE) {
+            compiled_moe_mixers_[i] = nullptr;
+            continue;
+        }
+
+        auto& self = *this;
+        int layer = i;
+
+        // Capture all weights by reference (they're stored in moe_layer_weights_)
+        std::function<std::vector<mx::array>(const std::vector<mx::array>&)> moe_fn =
+            [&self, layer, k, gs, bits, scale_factor, do_norm, n_group](
+                const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
+                auto& x = inputs[0];  // [B, L, hidden]
+                auto& w = *self.moe_layer_weights_[layer];
+                int B = x.shape(0), L = x.shape(1);
+
+                // Gate
+                auto logits = mx::matmul(x, mx::transpose(*w.gate_w, {1, 0}));
+                auto orig_scores = mx::sigmoid(mx::astype(logits, mx::float32));
+                auto sel_scores = orig_scores;
+                if (w.gate_correction_bias.has_value()) {
+                    sel_scores = mx::add(sel_scores, *w.gate_correction_bias);
+                }
+
+                // Top-k selection (n_group=1 fast path)
+                auto topk_inds = mx::argpartition(mx::negative(sel_scores), k - 1, -1);
+                topk_inds = mx::slice(topk_inds, {0, 0, 0}, {B, L, k});
+                auto topk_scores = mx::take_along_axis(orig_scores, topk_inds, -1);
+                if (do_norm && k > 1) {
+                    auto denom = mx::add(mx::sum(topk_scores, -1, true), mx::array(1e-20f));
+                    topk_scores = mx::divide(topk_scores, denom);
+                }
+                topk_scores = mx::multiply(topk_scores, mx::array(scale_factor));
+
+                // SwitchMLP
+                auto x_exp = mx::expand_dims(x, {-2, -3});
+                auto h = mx::gather_qmm(x_exp, *w.fc1_w, *w.fc1_s, w.fc1_b,
+                    std::nullopt, topk_inds, true, gs, bits, "affine", false);
+                h = relu2(h);
+                h = mx::gather_qmm(h, *w.fc2_w, *w.fc2_s, w.fc2_b,
+                    std::nullopt, topk_inds, true, gs, bits, "affine", false);
+                h = mx::squeeze(h, -2);
+
+                // Weighted sum — cast back to model dtype (critical: prevents float32 infection)
+                auto y = mx::astype(
+                    mx::sum(mx::multiply(h, mx::expand_dims(topk_scores, -1)), -2),
+                    x.dtype());
+
+                // Shared expert
+                if (w.has_shared_expert) {
+                    auto shared = mx::quantized_matmul(x, *w.shared_up_w, *w.shared_up_s, w.shared_up_b,
+                        true, gs, bits);
+                    shared = relu2(shared);
+                    shared = mx::quantized_matmul(shared, *w.shared_down_w, *w.shared_down_s, w.shared_down_b,
+                        true, gs, bits);
+                    y = mx::add(y, shared);
+                }
+                return {y};
+            };
+
+        compiled_moe_mixers_[i] = mx::compile(moe_fn, /*shapeless=*/false);
+        num_moe++;
+    }
+
+    compiled_moe_mixers_initialized_ = true;
+    std::cout << "[NemotronH] Compiled " << num_moe << " MoE mixer functions" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,12 +1638,15 @@ mx::array NemotronHModel::forward(
         init_mamba_states(B_dim);
     }
 
-    // Ensure weight cache is built (for fast MoE and compiled mamba)
+    // Ensure weight cache and compiled mixers are built
     if (!weight_cache_built_) {
         build_weight_cache();
     }
+    if (!compiled_moe_mixers_initialized_) {
+        init_compiled_moe_mixers();
+    }
 
-    // Direct forward: no compiled wrapper, build lazy graph like mlx-lm
+    // Direct forward with compiled MoE mixers for kernel fusion
     auto h = embed(input_ids);
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
@@ -1650,6 +1744,49 @@ mx::array NemotronHModel::forward(
     h = rms_norm(h, norm_f_w);
 
     return lm_head_proj(h);
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark helpers
+// ---------------------------------------------------------------------------
+
+mx::array NemotronHModel::embed_for_benchmark(const mx::array& input_ids) {
+    if (!mamba_states_initialized_) init_mamba_states(1);
+    if (!weight_cache_built_) build_weight_cache();
+    return embed(input_ids);
+}
+
+mx::array NemotronHModel::forward_one_block(mx::array& h, int i,
+    std::vector<mx::array>& cache_k, std::vector<mx::array>& cache_v, int offset) {
+    auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
+    auto normed = rms_norm(h, norm_w);
+    mx::array block_out = normed;
+    switch (block_types_[i]) {
+        case BlockType::Mamba: {
+            int idx = mamba_layer_indices_[i];
+            block_out = mamba_block(normed, i, idx);
+            break;
+        }
+        case BlockType::Attention: {
+            int idx = attn_layer_indices_[i];
+            block_out = attention_block(normed, i, idx, cache_k[idx], cache_v[idx], offset);
+            break;
+        }
+        case BlockType::MLP: block_out = mlp_block(normed, i); break;
+        case BlockType::MOE: block_out = moe_block(normed, i); break;
+    }
+    h = mx::add(h, block_out);
+    return h;
+}
+
+int NemotronHModel::block_type_int(int i) const {
+    switch (block_types_[i]) {
+        case BlockType::Mamba: return 0;
+        case BlockType::Attention: return 1;
+        case BlockType::MLP: return 2;
+        case BlockType::MOE: return 3;
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------------------

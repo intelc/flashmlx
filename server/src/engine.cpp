@@ -186,8 +186,8 @@ double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_t
     auto token = mx::argmax(last_logits, -1);
     mx::eval({token});
 
-    // Warmup decode (5 steps)
-    for (int i = 0; i < 5; i++) {
+    // Warmup decode (50 steps — ensure all Metal shaders are compiled)
+    for (int i = 0; i < 50; i++) {
         auto input_ids = mx::reshape(token, {1, 1});
         logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + i);
         last_logits = mx::reshape(logits, {1, -1});
@@ -195,11 +195,36 @@ double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_t
         mx::eval({token});
     }
 
+    // Profile: time a single forward pass with per-block eval barriers
+    auto* nemotron = dynamic_cast<NemotronHModel*>(model_.get());
+    if (nemotron) {
+        auto input_ids = mx::reshape(token, {1, 1});
+        auto h = nemotron->embed_for_benchmark(input_ids);
+        mx::eval({h});
+
+        double mamba_total = 0, moe_total = 0, attn_total = 0;
+        for (int i = 0; i < model_->config().num_hidden_layers; i++) {
+            auto tb = std::chrono::high_resolution_clock::now();
+            h = nemotron->forward_one_block(h, i, cache_k, cache_v, prompt_len + 5);
+            mx::eval({h});
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - tb).count();
+
+            int bt = nemotron->block_type_int(i);
+            if (bt == 0) mamba_total += ms;
+            else if (bt == 1) attn_total += ms;
+            else if (bt == 3) moe_total += ms;
+        }
+        std::cout << "[Profile] Mamba=" << mamba_total << "ms MoE=" << moe_total
+                  << "ms Attn=" << attn_total << "ms Total="
+                  << (mamba_total + moe_total + attn_total) << "ms" << std::endl;
+    }
+
     // Timed decode loop — sequential eval like mlx-lm
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_tokens; i++) {
         auto input_ids = mx::reshape(token, {1, 1});
-        logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + 5 + i);
+        logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + 6 + i);
         last_logits = mx::reshape(logits, {1, -1});
         token = mx::argmax(last_logits, -1);
         mx::eval({token});
