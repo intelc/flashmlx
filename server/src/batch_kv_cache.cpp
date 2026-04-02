@@ -105,16 +105,7 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
         {0, 0, write_pos_, 0},
         {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
 
-    // Periodic eval to flatten graph depth (fewer syncs = better throughput)
-    if (layer == num_layers_ - 1 && write_pos_ > 0 && write_pos_ % 32 == 0) {
-        std::vector<mx::array> to_eval;
-        to_eval.reserve(num_layers_ * 2);
-        for (int l = 0; l < num_layers_; l++) {
-            to_eval.push_back(*keys_[l]);
-            to_eval.push_back(*values_[l]);
-        }
-        mx::eval(to_eval);
-    }
+    // Cache eval happens in scheduler's decode_batched alongside token eval
 }
 
 mx::array BatchKVCache::get_keys(int layer) const {
