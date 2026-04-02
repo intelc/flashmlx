@@ -1,11 +1,12 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.pytest_cache/
 .venv/
 dist/
 build/
-harness/baselines.json
-autobench/results.tsv
+server/build/
+*.so
 *.log
 .DS_Store
 models/
