@@ -1781,6 +1781,16 @@ mx::array NemotronHModel::forward_heterogeneous(
     return forward(input_ids, cache_keys, cache_values, offsets);
 }
 
+// Stub: NemotronHModel doesn't support batched forward yet
+ModelBase::BatchedForwardResult NemotronHModel::forward_batched(
+    const mx::array& /*input_ids*/,
+    const std::vector<mx::array>& /*cache_keys*/,
+    const std::vector<mx::array>& /*cache_values*/,
+    const mx::array& /*rope_offsets*/,
+    const mx::array& /*mask*/) {
+    throw std::runtime_error("NemotronHModel does not support forward_batched");
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark helpers
 // ---------------------------------------------------------------------------

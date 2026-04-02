@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -93,6 +94,22 @@ public:
         const mx::array& offsets,
         int max_kv_len) = 0;
 
+    /// Result of forward_batched: logits + new K/V tensors for caller to write.
+    struct BatchedForwardResult {
+        mx::array logits;
+        std::vector<mx::array> new_keys;   // [B, n_kv, 1, hd] per layer
+        std::vector<mx::array> new_values;
+    };
+
+    /// Batched forward with read-only caches (for BatchKVCache integration).
+    /// Does NOT modify caches — returns new K/V for caller to write.
+    virtual BatchedForwardResult forward_batched(
+        const mx::array& input_ids,
+        const std::vector<mx::array>& cache_keys,   // [B, n_kv, seq_len, hd] per layer (read-only)
+        const std::vector<mx::array>& cache_values,
+        const mx::array& rope_offsets,               // [B] per-sequence RoPE offsets
+        const mx::array& mask) = 0;                  // [B, 1, 1, seq_len] attention mask
+
     virtual const ModelConfig& config() const = 0;
     virtual std::vector<int> debug_forward(const std::vector<int>& token_ids) = 0;
     virtual std::vector<float> debug_embed(const std::vector<int>& token_ids) = 0;
@@ -124,6 +141,14 @@ public:
         std::vector<mx::array>& cache_values,
         const mx::array& offsets,
         int max_kv_len) override;
+
+    /// Batched forward with read-only caches (for BatchKVCache).
+    BatchedForwardResult forward_batched(
+        const mx::array& input_ids,
+        const std::vector<mx::array>& cache_keys,
+        const std::vector<mx::array>& cache_values,
+        const mx::array& rope_offsets,
+        const mx::array& mask) override;
 
     const ModelConfig& config() const override { return config_; }
 
@@ -164,6 +189,11 @@ private:
         const mx::array& offsets, int max_kv_len,
         const mx::array& mask,
         const mx::array& scatter_idx);
+    std::tuple<mx::array, mx::array, mx::array> attention_batched(
+        const mx::array& x, int layer,
+        const mx::array& cache_k, const mx::array& cache_v,
+        const mx::array& rope_offsets,
+        const mx::array& mask);
     mx::array transformer_block_heterogeneous(
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
@@ -241,6 +271,14 @@ public:
         std::vector<mx::array>& cache_values,
         const mx::array& offsets,
         int max_kv_len) override;
+
+    /// Stub: Nemotron-H does not support batched forward yet.
+    BatchedForwardResult forward_batched(
+        const mx::array& input_ids,
+        const std::vector<mx::array>& cache_keys,
+        const std::vector<mx::array>& cache_values,
+        const mx::array& rope_offsets,
+        const mx::array& mask) override;
 
     const ModelConfig& config() const override { return config_; }
     std::vector<int> debug_forward(const std::vector<int>& token_ids) override;

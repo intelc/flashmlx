@@ -1056,6 +1056,103 @@ mx::array LlamaModel::forward(
 }
 
 // ---------------------------------------------------------------------------
+// Batched forward (read-only caches, for BatchKVCache)
+// ---------------------------------------------------------------------------
+
+std::tuple<mx::array, mx::array, mx::array> LlamaModel::attention_batched(
+    const mx::array& x, int layer,
+    const mx::array& cache_k, const mx::array& cache_v,
+    const mx::array& rope_offsets,
+    const mx::array& mask) {
+
+    const auto& lw = layer_weights_[layer];
+    int B = x.shape(0);
+    int L = x.shape(1);  // always 1 for decode
+    int n_heads = config_.num_attention_heads;
+    int n_kv_heads = config_.num_key_value_heads;
+    int hd = head_dim_;
+
+    auto q = linear_fast(x, lw.q_w, lw.q_s, lw.q_b);
+    auto k = linear_fast(x, lw.k_w, lw.k_s, lw.k_b);
+    auto v = linear_fast(x, lw.v_w, lw.v_s, lw.v_b);
+
+    if (lw.q_bias) q = mx::add(q, *lw.q_bias);
+    if (lw.k_bias) k = mx::add(k, *lw.k_bias);
+    if (lw.v_bias) v = mx::add(v, *lw.v_bias);
+
+    q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
+    k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
+    v = mx::transpose(mx::reshape(v, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
+
+    if (lw.has_q_norm) {
+        q = rms_norm(q, lw.q_norm_w);
+        k = rms_norm(k, lw.k_norm_w);
+    }
+
+    // RoPE with per-sequence offsets (actual token position, not buffer position)
+    q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, rope_offsets);
+    k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, rope_offsets);
+
+    // Concat new K/V to cached K/V for this step's attention
+    // cache_k: [B, n_kv, write_pos, hd], k: [B, n_kv, 1, hd]
+    auto full_k = mx::concatenate({cache_k, k}, 2);  // [B, n_kv, write_pos+1, hd]
+    auto full_v = mx::concatenate({cache_v, v}, 2);
+
+    // Extend mask by 1 column for the new token (always valid = 0.0)
+    auto valid_col = mx::zeros({B, 1, 1, 1}, mask.dtype());
+    auto full_mask = mx::concatenate({mask, valid_col}, 3);  // [B, 1, 1, write_pos+1]
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    auto attn_out = mx::fast::scaled_dot_product_attention(
+        q, full_k, full_v, scale, /*mask_mode=*/"", /*mask=*/full_mask);
+
+    attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
+    auto output = linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b);
+
+    return {output, k, v};  // Return new K/V for caller to write to cache
+}
+
+ModelBase::BatchedForwardResult LlamaModel::forward_batched(
+    const mx::array& input_ids,
+    const std::vector<mx::array>& cache_keys,
+    const std::vector<mx::array>& cache_values,
+    const mx::array& rope_offsets,
+    const mx::array& mask) {
+
+    auto h = embed(input_ids);
+
+    std::vector<mx::array> all_new_keys, all_new_values;
+    all_new_keys.reserve(config_.num_hidden_layers);
+    all_new_values.reserve(config_.num_hidden_layers);
+
+    for (int i = 0; i < config_.num_hidden_layers; i++) {
+        const auto& lw = layer_weights_[i];
+        auto normed = rms_norm(h, lw.input_norm_w);
+
+        auto [attn_out, new_k, new_v] = attention_batched(
+            normed, i, cache_keys[i], cache_values[i], rope_offsets, mask);
+        all_new_keys.push_back(new_k);
+        all_new_values.push_back(new_v);
+
+        h = mx::add(h, attn_out);
+        auto normed2 = rms_norm(h, lw.post_norm_w);
+        auto mlp_out = [&]() -> mx::array {
+            if (!layer_is_moe_.empty() && i < (int)layer_is_moe_.size() && layer_is_moe_[i]) {
+                return moe_block(normed2, i);
+            } else {
+                return mlp_fast(normed2, i);
+            }
+        }();
+        h = mx::add(h, mlp_out);
+    }
+
+    h = rms_norm(h, *norm_w_);
+    auto logits = lm_head(h);
+
+    return {logits, std::move(all_new_keys), std::move(all_new_values)};
+}
+
+// ---------------------------------------------------------------------------
 // Debug helpers
 // ---------------------------------------------------------------------------
 
