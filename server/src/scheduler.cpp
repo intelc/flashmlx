@@ -169,64 +169,94 @@ void BatchScheduler::prefill_request(Request& req) {
 void BatchScheduler::decode_request(Request& req) {
     int slot = req.kv_slot;
     int num_layers = pool_.num_layers();
+    bool is_moe = model_.config().n_routed_experts > 0;
 
-    // N-step graph batching: build N forward passes before eval
-    // Hybrid models (MoE/Mamba) have huge per-step state, so use small N
-    // Dense transformers can batch more aggressively
-    int batch_n;
-    if (model_.config().n_routed_experts > 0 || model_.config().num_hidden_layers > 50) {
-        batch_n = 1;  // MoE/hybrid: 1-step with async pipelining (matches mlx-lm)
-    } else if (model_.config().num_hidden_layers > 40) {
-        batch_n = 32;
-    } else {
-        batch_n = 32;
-    }
-    int N = std::min(batch_n, req.max_tokens - req.generated_count);
+    if (is_moe) {
+        // MoE/hybrid: 1-step with async pipelining (matches mlx-lm pattern)
+        // Build next step while GPU evaluates current step
+        auto build_step = [&](mx::array& prev, int offset) -> mx::array {
+            auto input_ids = mx::reshape(prev, {1, 1});
+            std::vector<mx::array> ck, cv;
+            ck.reserve(num_layers); cv.reserve(num_layers);
+            for (int l = 0; l < num_layers; ++l) {
+                ck.push_back(pool_.keys(slot, l));
+                cv.push_back(pool_.values(slot, l));
+            }
+            mx::array logits = model_.forward(input_ids, ck, cv, offset);
+            for (int l = 0; l < num_layers; ++l) {
+                pool_.keys(slot, l) = ck[l];
+                pool_.values(slot, l) = cv[l];
+            }
+            mx::array last_logits = mx::reshape(logits, {1, -1});
+            return sample_token(last_logits, req.temperature);
+        };
 
-    std::vector<mx::array> step_tokens;
-    mx::array prev_token = req.next_token;
+        int remaining = req.max_tokens - req.generated_count;
+        mx::array cur_token = req.next_token;
 
-    for (int s = 0; s < N; s++) {
-        // Build input_ids [1, 1] — use prev_token directly (lazy, no eval needed)
-        auto input_ids = mx::reshape(prev_token, {1, 1});
+        // Build first step
+        auto next_token = build_step(cur_token, req.cache_offset);
+        mx::async_eval({next_token});
 
-        // Gather cache arrays for this slot
-        std::vector<mx::array> cache_keys;
-        std::vector<mx::array> cache_values;
-        cache_keys.reserve(num_layers);
-        cache_values.reserve(num_layers);
-        for (int l = 0; l < num_layers; ++l) {
-            cache_keys.push_back(pool_.keys(slot, l));
-            cache_values.push_back(pool_.values(slot, l));
+        for (int s = 1; s < remaining; s++) {
+            // Build step s while GPU evaluates step s-1
+            auto next_next = build_step(next_token, req.cache_offset + s);
+            mx::async_eval({next_next});
+
+            // Extract previous token (should be ready by now)
+            int tok_id = next_token.item<int>();
+            req.output_tokens.push_back(tok_id);
+            req.generated_count++;
+            req.cache_offset++;
+
+            if (req.generated_count >= req.max_tokens) {
+                req.next_token = next_next;
+                return;
+            }
+            next_token = next_next;
         }
-
-        // Forward pass with int offset (no mx::eval sync!)
-        mx::array logits = model_.forward(input_ids, cache_keys, cache_values, req.cache_offset + s);
-
-        // Write updated caches back to pool
-        for (int l = 0; l < num_layers; ++l) {
-            pool_.keys(slot, l) = cache_keys[l];
-            pool_.values(slot, l) = cache_values[l];
-        }
-
-        // Sample (lazy)
-        mx::array last_logits = mx::reshape(logits, {1, -1});
-        mx::array token = sample_token(last_logits, req.temperature);
-        step_tokens.push_back(token);
-        prev_token = token;
-    }
-
-    // Async eval all N tokens — overlap GPU compute with C++ bookkeeping
-    mx::async_eval(step_tokens);
-
-    // Extract token IDs and update request state
-    for (auto& tok : step_tokens) {
-        int tok_id = tok.item<int>();
+        // Extract final token
+        int tok_id = next_token.item<int>();
         req.output_tokens.push_back(tok_id);
         req.generated_count++;
         req.cache_offset++;
+        req.next_token = next_token;
+    } else {
+        // Dense models: N-step graph batching
+        int batch_n = 32;
+        int N = std::min(batch_n, req.max_tokens - req.generated_count);
+
+        std::vector<mx::array> step_tokens;
+        mx::array prev_token = req.next_token;
+
+        for (int s = 0; s < N; s++) {
+            auto input_ids = mx::reshape(prev_token, {1, 1});
+            std::vector<mx::array> cache_keys, cache_values;
+            cache_keys.reserve(num_layers); cache_values.reserve(num_layers);
+            for (int l = 0; l < num_layers; ++l) {
+                cache_keys.push_back(pool_.keys(slot, l));
+                cache_values.push_back(pool_.values(slot, l));
+            }
+            mx::array logits = model_.forward(input_ids, cache_keys, cache_values, req.cache_offset + s);
+            for (int l = 0; l < num_layers; ++l) {
+                pool_.keys(slot, l) = cache_keys[l];
+                pool_.values(slot, l) = cache_values[l];
+            }
+            mx::array last_logits = mx::reshape(logits, {1, -1});
+            mx::array token = sample_token(last_logits, req.temperature);
+            step_tokens.push_back(token);
+            prev_token = token;
+        }
+
+        mx::async_eval(step_tokens);
+        for (auto& tok : step_tokens) {
+            int tok_id = tok.item<int>();
+            req.output_tokens.push_back(tok_id);
+            req.generated_count++;
+            req.cache_offset++;
+        }
+        req.next_token = step_tokens.back();
     }
-    req.next_token = step_tokens.back();
 }
 
 void BatchScheduler::decode_batch(

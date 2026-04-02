@@ -154,8 +154,6 @@ std::vector<float> Engine::debug_embed(const std::vector<int>& token_ids) {
 }
 
 double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_tokens) {
-    // Direct decode loop — no scheduler, no threading, no polling
-    // Matches mlx-lm's sequential pattern: forward → eval → next
     const auto& cfg = model_->config();
     int n_kv = cfg.num_key_value_heads;
     int hd = cfg.head_dim > 0 ? cfg.head_dim : cfg.hidden_size / cfg.num_attention_heads;
@@ -220,17 +218,31 @@ double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_t
                   << (mamba_total + moe_total + attn_total) << "ms" << std::endl;
     }
 
-    // Timed decode loop — sequential eval like mlx-lm
+    // Timed decode: double-buffered async_eval (best: N=1 pipelining)
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < num_tokens; i++) {
+    {
         auto input_ids = mx::reshape(token, {1, 1});
-        logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + 6 + i);
+        logits = model_->forward(input_ids, cache_k, cache_v, prompt_len + 50);
         last_logits = mx::reshape(logits, {1, -1});
-        token = mx::argmax(last_logits, -1);
-        mx::eval({token});
+        auto next_token = mx::argmax(last_logits, -1);
+        mx::async_eval({next_token});
+
+        for (int i = 1; i < num_tokens; i++) {
+            auto next_input = mx::reshape(next_token, {1, 1});
+            logits = model_->forward(next_input, cache_k, cache_v, prompt_len + 50 + i);
+            last_logits = mx::reshape(logits, {1, -1});
+            auto next_next_token = mx::argmax(last_logits, -1);
+            mx::async_eval({next_next_token});
+            next_token = next_next_token;
+            // Clear allocator cache periodically (matches mlx-lm every 256 tokens)
+            if (i % 256 == 0) mx::clear_cache();
+        }
+        mx::eval({next_token});
+        token = next_token;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
     return num_tokens / elapsed;
 }
 

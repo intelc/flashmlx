@@ -506,9 +506,11 @@ std::vector<mx::array> NemotronHModel::mamba_block_functional_fast(
     int gate_size = d_inner_;
     int dt_size = mamba_num_heads_;
 
-    auto gate = mx::slice(proj, {0, 0, 0}, {B_dim, 1, gate_size});
-    auto conv_input = mx::slice(proj, {0, 0, gate_size}, {B_dim, 1, gate_size + conv_dim_});
-    auto dt = mx::slice(proj, {0, 0, gate_size + conv_dim_}, {B_dim, 1, gate_size + conv_dim_ + dt_size});
+    // Split proj into gate, conv_input, dt using mx::split (1 op vs 3 slices)
+    auto proj_parts = mx::split(proj, {gate_size, gate_size + conv_dim_}, -1);
+    auto& gate = proj_parts[0];
+    auto& conv_input = proj_parts[1];
+    auto& dt = proj_parts[2];
 
     // Conv1d
     auto full_window = mx::concatenate({conv_state, conv_input}, 1);
@@ -517,15 +519,16 @@ std::vector<mx::array> NemotronHModel::mamba_block_functional_fast(
     if (w.conv1d_bias) conv_out = mx::add(conv_out, *w.conv1d_bias);
     conv_out = mx::multiply(conv_out, mx::sigmoid(conv_out));
 
-    // Split
-    auto hidden_states = mx::slice(conv_out, {0, 0, 0}, {B_dim, 1, d_inner_});
+    // Split conv output using mx::split (1 op vs 3 slices)
     int bc_size = n_groups_ * ssm_state_size_;
-    auto B_ssm = mx::slice(conv_out, {0, 0, d_inner_}, {B_dim, 1, d_inner_ + bc_size});
-    auto C_ssm = mx::slice(conv_out, {0, 0, d_inner_ + bc_size}, {B_dim, 1, d_inner_ + 2 * bc_size});
+    auto conv_parts = mx::split(conv_out, {d_inner_, d_inner_ + bc_size}, -1);
+    auto& hidden_states_raw = conv_parts[0];
+    auto& B_ssm_raw = conv_parts[1];
+    auto& C_ssm_raw = conv_parts[2];
 
-    hidden_states = mx::reshape(hidden_states, {B_dim, mamba_num_heads_, mamba_head_dim_});
-    B_ssm = mx::reshape(B_ssm, {B_dim, n_groups_, ssm_state_size_});
-    C_ssm = mx::reshape(C_ssm, {B_dim, n_groups_, ssm_state_size_});
+    auto hidden_states = mx::reshape(hidden_states_raw, {B_dim, mamba_num_heads_, mamba_head_dim_});
+    auto B_ssm = mx::reshape(B_ssm_raw, {B_dim, n_groups_, ssm_state_size_});
+    auto C_ssm = mx::reshape(C_ssm_raw, {B_dim, n_groups_, ssm_state_size_});
 
     dt = compute_dt(dt, *w.dt_bias, time_step_min_, time_step_max_);
     dt = mx::reshape(dt, {B_dim, mamba_num_heads_});
@@ -666,15 +669,12 @@ mx::array NemotronHModel::mamba_block(
     int gate_size = d_inner_;
     int dt_size = mamba_num_heads_;
 
-    auto gate = mx::slice(proj, {0, 0, 0}, {B_dim, L, gate_size});
-    auto conv_input = mx::slice(proj, {0, 0, gate_size}, {B_dim, L, gate_size + conv_dim_});
-    auto dt = mx::slice(proj, {0, 0, gate_size + conv_dim_}, {B_dim, L, gate_size + conv_dim_ + dt_size});
+    // Split proj into gate, conv_input, dt (1 op vs 3 slices)
+    auto proj_parts = mx::split(proj, {gate_size, gate_size + conv_dim_}, -1);
+    auto gate = proj_parts[0];
+    auto conv_input = proj_parts[1];
+    auto dt = proj_parts[2];
 
-    // Conv1d with state management
-    // conv_state: [B, conv_kernel-1, conv_dim]
-    // For token-by-token decode:
-    //   - shift conv_state left, append conv_input
-    //   - apply depthwise conv1d + silu
     auto& conv_state = mamba_conv_states_[mamba_idx];
 
     if (L == 1) {
@@ -704,19 +704,13 @@ mx::array NemotronHModel::mamba_block(
         // SiLU activation
         conv_out = mx::multiply(conv_out, mx::sigmoid(conv_out));
 
-        // Split conv output: hidden_states, B_ssm, C_ssm
-        auto hidden_states = mx::slice(conv_out, {0, 0, 0}, {B_dim, 1, d_inner_});
+        // Split conv output (1 op vs 3 slices)
         int bc_size = n_groups_ * ssm_state_size_;
-        auto B_ssm = mx::slice(conv_out, {0, 0, d_inner_}, {B_dim, 1, d_inner_ + bc_size});
-        auto C_ssm = mx::slice(conv_out, {0, 0, d_inner_ + bc_size}, {B_dim, 1, d_inner_ + 2 * bc_size});
+        auto conv_parts = mx::split(conv_out, {d_inner_, d_inner_ + bc_size}, -1);
 
-        // Reshape for SSM
-        // hidden: [B, 1, n_heads, head_dim]
-        hidden_states = mx::reshape(hidden_states, {B_dim, mamba_num_heads_, mamba_head_dim_});
-        // B_ssm: [B, n_groups, state_size]
-        B_ssm = mx::reshape(B_ssm, {B_dim, n_groups_, ssm_state_size_});
-        // C_ssm: [B, n_groups, state_size]
-        C_ssm = mx::reshape(C_ssm, {B_dim, n_groups_, ssm_state_size_});
+        auto hidden_states = mx::reshape(conv_parts[0], {B_dim, mamba_num_heads_, mamba_head_dim_});
+        auto B_ssm = mx::reshape(conv_parts[1], {B_dim, n_groups_, ssm_state_size_});
+        auto C_ssm = mx::reshape(conv_parts[2], {B_dim, n_groups_, ssm_state_size_});
 
         // Compute dt: softplus + clip
         auto dt_bias = get_weight(prefix + ".dt_bias");  // [n_heads]
