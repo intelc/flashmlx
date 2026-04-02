@@ -105,6 +105,34 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
         {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
 }
 
+void BatchKVCache::replace_caches(const std::vector<mx::array>& new_keys,
+                                   const std::vector<mx::array>& new_values) {
+    if (!valid_) throw std::runtime_error("BatchKVCache::replace_caches: cache not valid");
+    // Replace cache arrays directly with concatenated results from forward_batched.
+    // new_keys[l] shape: [B, n_kv, write_pos+1, hd] (includes new token from concat in attention)
+    for (int l = 0; l < num_layers_; l++) {
+        keys_[l] = new_keys[l];
+        values_[l] = new_values[l];
+    }
+    // Extend mask by 1 valid column (the new token is always valid)
+    auto valid_col = mx::zeros({batch_size_, 1, 1, 1}, dtype_);
+    mask_ = mx::concatenate({*mask_, valid_col}, 3);
+    // Update buf_len to match
+    buf_len_ = new_keys[0].shape(2);
+
+    // Periodically eval caches to flatten the computation graph
+    // Without this, concat chains create O(N) deep graphs over N steps
+    if (buf_len_ % 64 == 0) {
+        std::vector<mx::array> to_eval;
+        for (int l = 0; l < num_layers_; l++) {
+            to_eval.push_back(*keys_[l]);
+            to_eval.push_back(*values_[l]);
+        }
+        to_eval.push_back(*mask_);
+        mx::eval(to_eval);
+    }
+}
+
 mx::array BatchKVCache::get_keys(int layer) const {
     if (!valid_) throw std::runtime_error("BatchKVCache::get_keys: cache not valid");
     return mx::slice(*keys_[layer], {0, 0, 0, 0},

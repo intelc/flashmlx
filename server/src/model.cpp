@@ -1109,7 +1109,9 @@ std::tuple<mx::array, mx::array, mx::array> LlamaModel::attention_batched(
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
     auto output = linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b);
 
-    return {output, k, v};  // Return new K/V for caller to write to cache
+    // Return the concatenated full caches — caller stores them directly
+    // (no separate write step needed, cache grows naturally via concat)
+    return {output, full_k, full_v};
 }
 
 ModelBase::BatchedForwardResult LlamaModel::forward_batched(
