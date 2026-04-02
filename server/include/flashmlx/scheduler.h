@@ -78,6 +78,13 @@ private:
     ModelBase& model_;
     KVCachePool& pool_;
 
+    // Persistent batched KV caches for heterogeneous decode
+    // Avoids per-step concat/split when the same set of requests is active
+    std::vector<mx::array> batch_cache_k_;  // [B, n_kv, max_kv_len, hd] per layer
+    std::vector<mx::array> batch_cache_v_;
+    std::vector<std::string> batch_ids_;    // request IDs in current batch
+    bool batch_cache_valid_ = false;
+
     // Pending queue — accessed from submit() (Python thread) and step() (C++ thread)
     std::deque<Request> pending_;
     std::mutex pending_mutex_;
