@@ -113,7 +113,7 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
             to_eval.push_back(*keys_[l]);
             to_eval.push_back(*values_[l]);
         }
-        mx::async_eval(to_eval);
+        mx::eval(to_eval);
     }
 }
 
