@@ -8,6 +8,14 @@ namespace flashmlx {
 BatchScheduler::BatchScheduler(ModelBase& model, KVCachePool& pool)
     : model_(model), pool_(pool) {}
 
+size_t BatchScheduler::hash_tokens(const std::vector<int>& tokens) {
+    size_t seed = tokens.size();
+    for (auto& t : tokens) {
+        seed ^= std::hash<int>{}(t) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
+}
+
 void BatchScheduler::submit(Request req) {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     req.state = RequestState::QUEUED;
@@ -110,6 +118,55 @@ void BatchScheduler::prefill_request(Request& req) {
              : model_.config().hidden_size / model_.config().num_attention_heads;
     int max_ctx = pool_.max_context_len();
 
+    // Check prefix cache
+    size_t token_hash = hash_tokens(req.prompt_tokens);
+    auto cache_it = prefix_cache_.find(token_hash);
+    if (cache_it != prefix_cache_.end()) {
+        auto& cached = cache_it->second;
+        // Write cached KV data to pool slot
+        pool_.write_slot(slot, cached.keys, cached.values);
+
+        // Run a single-token forward on the last prompt token to get logits.
+        // Use the int-offset concat path: slice cache to [offset-1], forward adds 1 token.
+        auto last_token = mx::array({req.prompt_tokens.back()}, {1, 1}, mx::int32);
+        std::vector<mx::array> ck, cv;
+        ck.reserve(num_layers); cv.reserve(num_layers);
+        for (int l = 0; l < num_layers; ++l) {
+            ck.push_back(mx::slice(pool_.keys(slot, l),
+                {0, 0, 0, 0}, {1, n_kv, cached.offset - 1, hd}));
+            cv.push_back(mx::slice(pool_.values(slot, l),
+                {0, 0, 0, 0}, {1, n_kv, cached.offset - 1, hd}));
+        }
+        mx::array logits = model_.forward(last_token, ck, cv, cached.offset - 1);
+
+        // Write grown caches back to pool (concat path added 1 token, now at offset)
+        int new_len = cached.offset;
+        for (int l = 0; l < num_layers; ++l) {
+            auto full_buf = mx::zeros({1, n_kv, max_ctx, hd}, model_.config().activation_dtype);
+            pool_.keys(slot, l) = mx::slice_update(full_buf, ck[l],
+                {0, 0, 0, 0}, {1, n_kv, new_len, hd});
+            full_buf = mx::zeros({1, n_kv, max_ctx, hd}, model_.config().activation_dtype);
+            pool_.values(slot, l) = mx::slice_update(full_buf, cv[l],
+                {0, 0, 0, 0}, {1, n_kv, new_len, hd});
+        }
+
+        // Sample first token
+        int logits_seq_len = logits.shape(1);
+        mx::array last_logits = mx::slice(logits, {0, logits_seq_len - 1, 0},
+                                           {1, logits_seq_len, logits.shape(2)});
+        last_logits = mx::reshape(last_logits, {1, -1});
+        mx::array token = sample_token(last_logits, req.temperature);
+        mx::eval({token});
+        int tok_id = token.item<int>();
+
+        req.next_token = token;
+        req.output_tokens.push_back(tok_id);
+        req.generated_count = 1;
+        req.cache_offset = cached.offset;
+        req.state = RequestState::DECODING;
+        return;  // Skip full prefill
+    }
+
     // Build input_ids [1, prompt_len]
     auto input_ids = mx::array(req.prompt_tokens.data(),
                                {1, prompt_len}, mx::int32);
@@ -152,6 +209,26 @@ void BatchScheduler::prefill_request(Request& req) {
     req.generated_count = 1;
     req.cache_offset = prompt_len;
     req.state = RequestState::DECODING;
+
+    // Store in prefix cache for future reuse
+    {
+        std::vector<mx::array> cached_k, cached_v;
+        cached_k.reserve(num_layers);
+        cached_v.reserve(num_layers);
+        for (int l = 0; l < num_layers; ++l) {
+            cached_k.push_back(mx::copy(pool_.keys(slot, l)));
+            cached_v.push_back(mx::copy(pool_.values(slot, l)));
+        }
+        mx::eval(cached_k);
+        mx::eval(cached_v);
+        prefix_cache_[token_hash] = CachedPrefill{
+            std::move(cached_k), std::move(cached_v), req.cache_offset
+        };
+        // Evict oldest if over capacity
+        if ((int)prefix_cache_.size() > kPrefixCacheMaxEntries) {
+            prefix_cache_.erase(prefix_cache_.begin());
+        }
+    }
 }
 
 void BatchScheduler::decode_request(Request& req) {
