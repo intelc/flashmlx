@@ -984,10 +984,11 @@ mx::array LlamaModel::attention_heterogeneous(
     // offsets shape: [B] -> reshape to [B, 1, 1, 1] for broadcast
     auto positions = mx::arange(0, max_kv_len, mx::int32);  // [max_kv_len]
     auto offsets_4d = mx::reshape(offsets, {B, 1, 1, 1});    // [B, 1, 1, 1]
+    auto dtype = q.dtype();
     auto mask = mx::where(
         mx::less_equal(positions, offsets_4d),
-        mx::array(0.0f, mx::float32),
-        mx::array(-1e9f, mx::float32));  // [B, 1, 1, max_kv_len]
+        mx::array(0.0f, dtype),
+        mx::array(-1e9f, dtype));  // [B, 1, 1, max_kv_len]
 
     // Scaled dot product attention with explicit mask
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
