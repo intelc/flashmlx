@@ -464,7 +464,7 @@ void BatchScheduler::decode_batch_heterogeneous(
     bool cache_hit = batch_cache_valid_ && (ids == batch_ids_);
 
     if (!cache_hit) {
-        // Rebuild batched KV caches from pool slots
+        // Rebuild batched KV caches from pool slots, sliced to effective length
         batch_cache_k_.clear();
         batch_cache_v_.clear();
         batch_cache_k_.reserve(num_layers);
@@ -474,8 +474,10 @@ void BatchScheduler::decode_batch_heterogeneous(
             std::vector<mx::array> k_parts, v_parts;
             for (auto& id : ids) {
                 int slot = active_[id].kv_slot;
-                k_parts.push_back(pool_.keys(slot, l));
-                v_parts.push_back(pool_.values(slot, l));
+                k_parts.push_back(mx::slice(pool_.keys(slot, l),
+                    {0, 0, 0, 0}, {1, n_kv, max_kv_len, hd}));
+                v_parts.push_back(mx::slice(pool_.values(slot, l),
+                    {0, 0, 0, 0}, {1, n_kv, max_kv_len, hd}));
             }
             batch_cache_k_.push_back(mx::concatenate(k_parts, 0));
             batch_cache_v_.push_back(mx::concatenate(v_parts, 0));
@@ -484,29 +486,21 @@ void BatchScheduler::decode_batch_heterogeneous(
         batch_cache_valid_ = true;
     }
 
-    // 3. Slice to effective length for this step
-    std::vector<mx::array> step_cache_k, step_cache_v;
-    step_cache_k.reserve(num_layers);
-    step_cache_v.reserve(num_layers);
-    for (int l = 0; l < num_layers; l++) {
-        step_cache_k.push_back(mx::slice(batch_cache_k_[l],
-            {0, 0, 0, 0}, {B, n_kv, max_kv_len, hd}));
-        step_cache_v.push_back(mx::slice(batch_cache_v_[l],
-            {0, 0, 0, 0}, {B, n_kv, max_kv_len, hd}));
+    // 3. Extend caches by 1 position for the new token (pad with zeros)
+    //    Current cache: [B, n_kv, prev_max_kv_len, hd] → need [B, n_kv, max_kv_len, hd]
+    int cur_kv_len = batch_cache_k_[0].shape(2);
+    if (cur_kv_len < max_kv_len) {
+        int pad = max_kv_len - cur_kv_len;
+        for (int l = 0; l < num_layers; l++) {
+            auto pad_k = mx::zeros({B, n_kv, pad, hd}, batch_cache_k_[l].dtype());
+            auto pad_v = mx::zeros({B, n_kv, pad, hd}, batch_cache_v_[l].dtype());
+            batch_cache_k_[l] = mx::concatenate({batch_cache_k_[l], pad_k}, 2);
+            batch_cache_v_[l] = mx::concatenate({batch_cache_v_[l], pad_v}, 2);
+        }
     }
 
-    // 4. Heterogeneous forward pass (modifies step_cache via put_along_axis)
-    mx::array logits = model_.forward_heterogeneous(input_ids, step_cache_k, step_cache_v, offsets, max_kv_len);
-
-    // 5. Write updated caches back to persistent batch cache
-    //    forward_heterogeneous grew caches by 1 token via scatter
-    for (int l = 0; l < num_layers; l++) {
-        int new_len = step_cache_k[l].shape(2);
-        batch_cache_k_[l] = mx::slice_update(batch_cache_k_[l], step_cache_k[l],
-            {0, 0, 0, 0}, {B, n_kv, new_len, hd});
-        batch_cache_v_[l] = mx::slice_update(batch_cache_v_[l], step_cache_v[l],
-            {0, 0, 0, 0}, {B, n_kv, new_len, hd});
-    }
+    // 4. Forward pass — put_along_axis updates batch_cache_ via reference chain
+    mx::array logits = model_.forward_heterogeneous(input_ids, batch_cache_k_, batch_cache_v_, offsets, max_kv_len);
 
     // 6. Sample all tokens at once
     auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
