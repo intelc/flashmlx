@@ -59,6 +59,9 @@ private:
     void decode_batch(const std::vector<std::string>& ids,
                       std::unordered_map<std::string, std::vector<int>>& new_tokens,
                       std::vector<std::string>& done_ids);
+    void decode_batch_heterogeneous(const std::vector<std::string>& ids,
+                                    std::unordered_map<std::string, std::vector<int>>& new_tokens,
+                                    std::vector<std::string>& done_ids);
 
 
     ModelBase& model_;
