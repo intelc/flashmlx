@@ -2,6 +2,7 @@
 #include "flashmlx/batch_kv_cache.h"
 #include <mlx/compile.h>
 
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -1159,7 +1160,19 @@ mx::array LlamaModel::forward_batched_inplace(
     const mx::array& rope_offsets,
     const mx::array& mask) {
 
+    using clock = std::chrono::high_resolution_clock;
+    using us = std::chrono::microseconds;
+    // Graph-build timers (no mx::eval — measures CPU overhead only)
+    static double acc_embed_us = 0;
+    static double acc_attn_us = 0;
+    static double acc_mlp_us = 0;
+    static double acc_final_us = 0;
+    static int acc_calls = 0;
+
+    auto te0 = clock::now();
     auto h = embed(input_ids);
+    auto te1 = clock::now();
+    acc_embed_us += std::chrono::duration_cast<us>(te1 - te0).count();
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
         const auto& lw = layer_weights_[i];
@@ -1167,6 +1180,7 @@ mx::array LlamaModel::forward_batched_inplace(
 
         // Update-before-SDPA: write new K/V to cache first, then run SDPA
         // on the full cache including the new token. Avoids concat.
+        auto ta0 = clock::now();
         {
             int B = input_ids.shape(0);
             int n_kv_heads = config_.num_key_value_heads;
@@ -1201,7 +1215,10 @@ mx::array LlamaModel::forward_batched_inplace(
             attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
             h = mx::add(h, linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b));
         }
+        auto ta1 = clock::now();
+        acc_attn_us += std::chrono::duration_cast<us>(ta1 - ta0).count();
 
+        auto tm0 = clock::now();
         auto normed2 = rms_norm(h, lw.post_norm_w);
         auto mlp_out = [&]() -> mx::array {
             if (!layer_is_moe_.empty() && i < (int)layer_is_moe_.size() && layer_is_moe_[i]) {
@@ -1211,10 +1228,37 @@ mx::array LlamaModel::forward_batched_inplace(
             }
         }();
         h = mx::add(h, mlp_out);
+        auto tm1 = clock::now();
+        acc_mlp_us += std::chrono::duration_cast<us>(tm1 - tm0).count();
     }
 
+    auto tf0 = clock::now();
     h = rms_norm(h, *norm_w_);
-    return lm_head(h);
+    auto result = lm_head(h);
+    auto tf1 = clock::now();
+    acc_final_us += std::chrono::duration_cast<us>(tf1 - tf0).count();
+
+    acc_calls++;
+    if (acc_calls % 128 == 0) {
+        int nl = config_.num_hidden_layers;
+        std::cerr << "\n--- forward_batched_inplace graph-build timing (" << acc_calls << " calls) ---\n";
+        std::cerr << "  embedding        : " << (acc_embed_us / 1000.0) << " ms total, "
+                  << (acc_embed_us / acc_calls) << " us/call\n";
+        std::cerr << "  attention (all L): " << (acc_attn_us / 1000.0) << " ms total, "
+                  << (acc_attn_us / acc_calls) << " us/call ("
+                  << (acc_attn_us / acc_calls / nl) << " us/layer)\n";
+        std::cerr << "  mlp (all L)      : " << (acc_mlp_us / 1000.0) << " ms total, "
+                  << (acc_mlp_us / acc_calls) << " us/call ("
+                  << (acc_mlp_us / acc_calls / nl) << " us/layer)\n";
+        std::cerr << "  final norm+head  : " << (acc_final_us / 1000.0) << " ms total, "
+                  << (acc_final_us / acc_calls) << " us/call\n";
+        double total = acc_embed_us + acc_attn_us + acc_mlp_us + acc_final_us;
+        std::cerr << "  TOTAL graph-build: " << (total / 1000.0) << " ms ("
+                  << (total / acc_calls) << " us/call)\n";
+        std::cerr << "--- end forward timing ---\n\n";
+    }
+
+    return result;
 }
 
 // ---------------------------------------------------------------------------

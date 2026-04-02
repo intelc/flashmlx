@@ -529,6 +529,16 @@ void BatchScheduler::decode_batched(
     std::unordered_map<std::string, std::vector<int>>& new_tokens,
     std::vector<std::string>& done_ids) {
 
+    using clock = std::chrono::high_resolution_clock;
+    using us = std::chrono::microseconds;
+    static double acc_build_input_us = 0;
+    static double acc_cache_state_us = 0;
+    static double acc_forward_us = 0;
+    static double acc_cache_advance_us = 0;
+    static double acc_sample_us = 0;
+    static double acc_extract_us = 0;
+    static int acc_steps = 0;
+
     int B = static_cast<int>(ids.size());
     int num_layers = pool_.num_layers();
     int n_kv = model_.config().num_key_value_heads;
@@ -536,12 +546,15 @@ void BatchScheduler::decode_batched(
              : model_.config().hidden_size / model_.config().num_attention_heads;
 
     // 1. Build input tokens [B, 1]
+    auto t0 = clock::now();
     std::vector<int> tok_ids;
     tok_ids.reserve(B);
     for (auto& id : ids) {
         tok_ids.push_back(active_[id].next_token.item<int>());
     }
     auto input_ids = mx::array(tok_ids.data(), {B, 1}, mx::int32);
+    auto t1 = clock::now();
+    acc_build_input_us += std::chrono::duration_cast<us>(t1 - t0).count();
 
     // 2. Build or reuse BatchKVCache
     if (!batch_kv_cache_.valid() || ids != batch_ids_) {
@@ -565,19 +578,36 @@ void BatchScheduler::decode_batched(
         batch_ids_ = ids;
     }
 
-    // 3. Forward pass with in-place cache updates (enables buffer donation)
-    //    Views are created and released per-layer inside the forward pass,
-    //    so the cache buffer refcount is 1 when slice_update runs.
+    // 3. Get cache state (rope_offsets, mask)
+    auto t2 = clock::now();
     auto rope_offsets = batch_kv_cache_.get_rope_offsets();
     auto mask = batch_kv_cache_.get_mask();
-    auto logits = model_.forward_batched_inplace(input_ids, batch_kv_cache_, rope_offsets, mask);
-    batch_kv_cache_.advance();
+    auto t3 = clock::now();
+    acc_cache_state_us += std::chrono::duration_cast<us>(t3 - t2).count();
 
-    // 4. Sample all tokens at once
+    // 4. Forward pass with in-place cache updates
+    auto t4 = clock::now();
+    auto logits = model_.forward_batched_inplace(input_ids, batch_kv_cache_, rope_offsets, mask);
+    mx::eval({logits});
+    auto t5 = clock::now();
+    acc_forward_us += std::chrono::duration_cast<us>(t5 - t4).count();
+
+    // 5. Cache advance
+    auto t6 = clock::now();
+    batch_kv_cache_.advance();
+    auto t7 = clock::now();
+    acc_cache_advance_us += std::chrono::duration_cast<us>(t7 - t6).count();
+
+    // 6. Sample all tokens at once
+    auto t8 = clock::now();
     auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
     auto all_tokens = mx::argmax(all_logits, -1);
     mx::eval({all_tokens});
+    auto t9 = clock::now();
+    acc_sample_us += std::chrono::duration_cast<us>(t9 - t8).count();
 
+    // 7. Token extraction loop
+    auto t10 = clock::now();
     bool any_done = false;
     for (int b = 0; b < B; b++) {
         auto& req = active_[ids[b]];
@@ -596,8 +626,38 @@ void BatchScheduler::decode_batched(
             any_done = true;
         }
     }
+    auto t11 = clock::now();
+    acc_extract_us += std::chrono::duration_cast<us>(t11 - t10).count();
 
-    // 7. If any request completed, flush caches back to pool and invalidate
+    acc_steps++;
+
+    // Print summary when any request completes
+    if (any_done) {
+        std::cerr << "\n=== decode_batched timing summary (" << acc_steps << " steps, B=" << B << ") ===\n";
+        std::cerr << "  build_input_ids+offsets : " << (acc_build_input_us / 1000.0) << " ms total, "
+                  << (acc_build_input_us / acc_steps) << " us/step\n";
+        std::cerr << "  cache_state (rope+mask) : " << (acc_cache_state_us / 1000.0) << " ms total, "
+                  << (acc_cache_state_us / acc_steps) << " us/step\n";
+        std::cerr << "  forward_batched_inplace : " << (acc_forward_us / 1000.0) << " ms total, "
+                  << (acc_forward_us / acc_steps) << " us/step\n";
+        std::cerr << "  cache_advance           : " << (acc_cache_advance_us / 1000.0) << " ms total, "
+                  << (acc_cache_advance_us / acc_steps) << " us/step\n";
+        std::cerr << "  sample (argmax+eval)    : " << (acc_sample_us / 1000.0) << " ms total, "
+                  << (acc_sample_us / acc_steps) << " us/step\n";
+        std::cerr << "  extract loop            : " << (acc_extract_us / 1000.0) << " ms total, "
+                  << (acc_extract_us / acc_steps) << " us/step\n";
+        double total = acc_build_input_us + acc_cache_state_us + acc_forward_us
+                     + acc_cache_advance_us + acc_sample_us + acc_extract_us;
+        std::cerr << "  TOTAL                   : " << (total / 1000.0) << " ms ("
+                  << (total / acc_steps) << " us/step)\n";
+        std::cerr << "=== end timing ===\n\n";
+        // Reset accumulators
+        acc_build_input_us = acc_cache_state_us = acc_forward_us = 0;
+        acc_cache_advance_us = acc_sample_us = acc_extract_us = 0;
+        acc_steps = 0;
+    }
+
+    // 8. If any request completed, flush caches back to pool and invalidate
     if (any_done) {
         std::vector<std::vector<mx::array>> flush_keys, flush_values;
         batch_kv_cache_.flush_to_slots(flush_keys, flush_values);
