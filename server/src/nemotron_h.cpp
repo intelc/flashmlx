@@ -444,6 +444,7 @@ void NemotronHModel::build_weight_cache() {
                 MoELayerWeights w;
                 w.norm_w = get_weight(lp + ".norm.weight");
                 w.gate_w = get_weight(mp + ".gate.weight");
+                w.gate_w_t = mx::transpose(*w.gate_w, {1, 0});  // precompute
                 if (has_weight(mp + ".gate.e_score_correction_bias"))
                     w.gate_correction_bias = get_weight(mp + ".gate.e_score_correction_bias");
                 w.fc1_w = get_weight(mp + ".switch_mlp.fc1.weight");
@@ -1342,16 +1343,20 @@ void NemotronHModel::init_compiled_moe_mixers() {
         auto& self = *this;
         int layer = i;
 
-        // Capture all weights by reference (they're stored in moe_layer_weights_)
+        // Compiled: norm + MoE + residual as single unit for max fusion
+        float eps = config_.rms_norm_eps;
         std::function<std::vector<mx::array>(const std::vector<mx::array>&)> moe_fn =
-            [&self, layer, k, gs, bits, scale_factor, do_norm, n_group](
+            [&self, layer, k, gs, bits, scale_factor, do_norm, n_group, eps](
                 const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-                auto& x = inputs[0];  // [B, L, hidden]
+                auto& h_in = inputs[0];
                 auto& w = *self.moe_layer_weights_[layer];
+
+                // RMS norm
+                auto x = mx::fast::rms_norm(h_in, *w.norm_w, eps);
                 int B = x.shape(0), L = x.shape(1);
 
-                // Gate
-                auto logits = mx::matmul(x, mx::transpose(*w.gate_w, {1, 0}));
+                // Gate (using precomputed transpose)
+                auto logits = mx::matmul(x, *w.gate_w_t);
                 auto orig_scores = mx::sigmoid(mx::astype(logits, mx::float32));
                 auto sel_scores = orig_scores;
                 if (w.gate_correction_bias.has_value()) {
@@ -1391,7 +1396,8 @@ void NemotronHModel::init_compiled_moe_mixers() {
                         true, gs, bits);
                     y = mx::add(y, shared);
                 }
-                return {y};
+                // Residual connection
+                return {mx::add(h_in, y)};
             };
 
         compiled_moe_mixers_[i] = mx::compile(moe_fn, /*shapeless=*/false);
@@ -1645,43 +1651,58 @@ mx::array NemotronHModel::forward(
         init_compiled_moe_mixers();
     }
 
-    // Direct forward with per-layer compiled MoE mixers (best for Nemotron-30B)
+    // Ensure compiled mamba mixers are ready
+    if (!compiled_mamba_mixers_initialized_) {
+        init_compiled_mamba_mixers();
+    }
+
+    // Forward with compiled block mixers for kernel fusion
     auto h = embed(input_ids);
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
-        auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
-        auto normed = rms_norm(h, norm_w);
-
-        mx::array block_out = normed;  // placeholder, overwritten by each branch
         switch (block_types_[i]) {
             case BlockType::Mamba: {
+                auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
+                auto normed = rms_norm(h, norm_w);
                 int mamba_idx = mamba_layer_indices_[i];
-                block_out = mamba_block(normed, i, mamba_idx);
+                if (compiled_mamba_mixers_[i]) {
+                    auto results = compiled_mamba_mixers_[i]({
+                        normed, mamba_conv_states_[mamba_idx], mamba_ssm_states_[mamba_idx]
+                    });
+                    h = mx::add(h, results[0]);
+                    mamba_conv_states_[mamba_idx] = results[1];
+                    mamba_ssm_states_[mamba_idx] = results[2];
+                } else {
+                    h = mx::add(h, mamba_block(normed, i, mamba_idx));
+                }
                 break;
             }
             case BlockType::Attention: {
+                auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
+                auto normed = rms_norm(h, norm_w);
                 int attn_idx = attn_layer_indices_[i];
-                block_out = attention_block(normed, i, attn_idx,
-                                            cache_keys[attn_idx], cache_values[attn_idx],
-                                            cache_offset);
+                h = mx::add(h, attention_block(normed, i, attn_idx,
+                    cache_keys[attn_idx], cache_values[attn_idx], cache_offset));
                 break;
             }
             case BlockType::MLP: {
-                block_out = mlp_block(normed, i);
+                auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
+                auto normed = rms_norm(h, norm_w);
+                h = mx::add(h, mlp_block(normed, i));
                 break;
             }
             case BlockType::MOE: {
-                // Use compiled MoE mixer for kernel fusion (elementwise ops fused)
+                // Compiled norm+MoE+residual as single compiled unit
                 if (compiled_moe_mixers_initialized_ && compiled_moe_mixers_[i]) {
-                    block_out = compiled_moe_mixers_[i]({normed})[0];
+                    h = compiled_moe_mixers_[i]({h})[0];
                 } else {
-                    block_out = moe_block(normed, i);
+                    auto norm_w = get_weight("layers." + std::to_string(i) + ".norm.weight");
+                    auto normed = rms_norm(h, norm_w);
+                    h = mx::add(h, moe_block(normed, i));
                 }
                 break;
             }
         }
-
-        h = mx::add(h, block_out);
     }
 
     // Final norm

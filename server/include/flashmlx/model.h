@@ -327,6 +327,7 @@ private:
     struct MoELayerWeights {
         std::optional<mx::array> norm_w;
         std::optional<mx::array> gate_w;
+        std::optional<mx::array> gate_w_t;  // precomputed transpose
         std::optional<mx::array> gate_correction_bias;
         std::optional<mx::array> fc1_w, fc1_s, fc2_w, fc2_s;
         std::optional<mx::array> fc1_b, fc2_b;
