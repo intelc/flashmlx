@@ -105,8 +105,8 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
         {0, 0, write_pos_, 0},
         {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
 
-    // Periodic eval every 16 steps to flatten graph depth
-    if (layer == num_layers_ - 1 && write_pos_ > 0 && write_pos_ % 16 == 0) {
+    // Periodic eval to flatten graph depth (fewer syncs = better throughput)
+    if (layer == num_layers_ - 1 && write_pos_ > 0 && write_pos_ % 32 == 0) {
         std::vector<mx::array> to_eval;
         to_eval.reserve(num_layers_ * 2);
         for (int l = 0; l < num_layers_; l++) {
