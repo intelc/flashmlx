@@ -95,26 +95,16 @@ void BatchKVCache::update(const mx::array& k, const mx::array& v, int layer) {
     if (layer < 0 || layer >= num_layers_) throw std::out_of_range("BatchKVCache::update: bad layer");
 
     // k, v: [B, n_kv, 1, hd]
-    // slice_update with std::move for buffer donation
-    auto old_k = std::move(*keys_[layer]);
-    keys_[layer] = mx::slice_update(old_k, k,
+    // In-place update via overwrite_descriptor — same mechanism as Python's __setitem__.
+    // This swaps the array's internal descriptor to point to the slice_update result,
+    // enabling buffer donation (in-place Metal write when refcount==1).
+    // No graph chain accumulation — each overwrite_descriptor replaces the descriptor.
+    keys_[layer]->overwrite_descriptor(mx::slice_update(*keys_[layer], k,
         {0, 0, write_pos_, 0},
-        {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
-    auto old_v = std::move(*values_[layer]);
-    values_[layer] = mx::slice_update(old_v, v,
+        {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_}));
+    values_[layer]->overwrite_descriptor(mx::slice_update(*values_[layer], v,
         {0, 0, write_pos_, 0},
-        {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
-
-    // Periodic eval to flatten graph depth (fewer syncs = better throughput)
-    if (layer == num_layers_ - 1 && write_pos_ > 0 && write_pos_ % 32 == 0) {
-        std::vector<mx::array> to_eval;
-        to_eval.reserve(num_layers_ * 2);
-        for (int l = 0; l < num_layers_; l++) {
-            to_eval.push_back(*keys_[l]);
-            to_eval.push_back(*values_[l]);
-        }
-        mx::eval(to_eval);
-    }
+        {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_}));
 }
 
 mx::array BatchKVCache::get_keys(int layer) const {
