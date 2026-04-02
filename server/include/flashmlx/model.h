@@ -162,12 +162,14 @@ private:
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
         const mx::array& offsets, int max_kv_len,
-        const mx::array& mask);
+        const mx::array& mask,
+        const mx::array& scatter_idx);
     mx::array transformer_block_heterogeneous(
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
         const mx::array& offsets, int max_kv_len,
-        const mx::array& mask);
+        const mx::array& mask,
+        const mx::array& scatter_idx);
     mx::array mlp(const mx::array& x, int layer);
     mx::array mlp_fast(const mx::array& x, int layer);
 

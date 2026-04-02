@@ -917,7 +917,8 @@ mx::array LlamaModel::attention_heterogeneous(
     const mx::array& x, int layer,
     mx::array& cache_k, mx::array& cache_v,
     const mx::array& offsets, int max_kv_len,
-    const mx::array& mask) {
+    const mx::array& mask,
+    const mx::array& scatter_idx) {
 
     const auto& lw = layer_weights_[layer];
     int B = x.shape(0);
@@ -931,38 +932,30 @@ mx::array LlamaModel::attention_heterogeneous(
     auto k = linear_fast(x, lw.k_w, lw.k_s, lw.k_b);
     auto v = linear_fast(x, lw.v_w, lw.v_s, lw.v_b);
 
-    // Attention linear biases (e.g. Qwen2-MoE)
     if (lw.q_bias) q = mx::add(q, *lw.q_bias);
     if (lw.k_bias) k = mx::add(k, *lw.k_bias);
     if (lw.v_bias) v = mx::add(v, *lw.v_bias);
 
-    // Reshape to [B, n_heads, L, hd]
     q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
     k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
     v = mx::transpose(mx::reshape(v, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
 
-    // QK-norm (Qwen3)
     if (lw.has_q_norm) {
         q = rms_norm(q, lw.q_norm_w);
         k = rms_norm(k, lw.k_norm_w);
     }
 
-    // RoPE with per-sequence offsets (array overload)
     q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, offsets);
     k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, offsets);
 
-    // KV cache scatter: batched put_along_axis — single op for all B elements.
-    auto idx = mx::broadcast_to(mx::reshape(offsets, {B, 1, 1, 1}),
-                                {B, n_kv_heads, 1, hd});
-    cache_k = mx::put_along_axis(cache_k, idx, k, 2);
-    cache_v = mx::put_along_axis(cache_v, idx, v, 2);
+    // KV cache scatter with pre-built index
+    cache_k = mx::put_along_axis(cache_k, scatter_idx, k, 2);
+    cache_v = mx::put_along_axis(cache_v, scatter_idx, v, 2);
 
-    // SDPA with pre-built mask (built once in forward_heterogeneous)
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     auto attn_out = mx::fast::scaled_dot_product_attention(
         q, cache_k, cache_v, scale, /*mask_mode=*/"", /*mask=*/mask);
 
-    // [B, n_heads, L, hd] -> [B, L, n_heads * hd]
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
     return linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b);
 }
@@ -971,11 +964,12 @@ mx::array LlamaModel::transformer_block_heterogeneous(
     const mx::array& x, int layer,
     mx::array& cache_k, mx::array& cache_v,
     const mx::array& offsets, int max_kv_len,
-    const mx::array& mask) {
+    const mx::array& mask,
+    const mx::array& scatter_idx) {
 
     const auto& lw = layer_weights_[layer];
     auto normed = rms_norm(x, lw.input_norm_w);
-    auto attn_out = attention_heterogeneous(normed, layer, cache_k, cache_v, offsets, max_kv_len, mask);
+    auto attn_out = attention_heterogeneous(normed, layer, cache_k, cache_v, offsets, max_kv_len, mask, scatter_idx);
     auto h = mx::add(x, attn_out);
     auto normed2 = rms_norm(h, lw.post_norm_w);
 
@@ -999,8 +993,11 @@ mx::array LlamaModel::forward_heterogeneous(
 
     auto h = embed(input_ids);
 
-    // Build mask once for all layers
+    // Build mask and scatter index once for all layers
     int B = input_ids.shape(0);
+    int n_kv_heads = config_.num_key_value_heads;
+    int hd = head_dim_;
+
     auto positions = mx::arange(0, max_kv_len, mx::int32);
     auto offsets_4d = mx::reshape(offsets, {B, 1, 1, 1});
     auto dtype = config_.activation_dtype;
@@ -1009,8 +1006,11 @@ mx::array LlamaModel::forward_heterogeneous(
         mx::array(0.0f, dtype),
         mx::array(-1e9f, dtype));  // [B, 1, 1, max_kv_len]
 
+    // Scatter index: [B, n_kv_heads, 1, hd] — same for all layers
+    auto scatter_idx = mx::broadcast_to(offsets_4d, {B, n_kv_heads, 1, hd});
+
     for (int i = 0; i < config_.num_hidden_layers; i++) {
-        h = transformer_block_heterogeneous(h, i, cache_keys[i], cache_values[i], offsets, max_kv_len, mask);
+        h = transformer_block_heterogeneous(h, i, cache_keys[i], cache_values[i], offsets, max_kv_len, mask, scatter_idx);
     }
     h = rms_norm(h, *norm_w_);
     return lm_head(h);
