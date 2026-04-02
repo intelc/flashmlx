@@ -218,7 +218,7 @@ double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_t
                   << (mamba_total + moe_total + attn_total) << "ms" << std::endl;
     }
 
-    // Timed decode: double-buffered async_eval (best: N=1 pipelining)
+    // Timed decode: N=1 double-buffered async_eval (best for MoE)
     auto t0 = std::chrono::high_resolution_clock::now();
     {
         auto input_ids = mx::reshape(token, {1, 1});
@@ -234,7 +234,6 @@ double Engine::benchmark_decode(const std::vector<int>& prompt_tokens, int num_t
             auto next_next_token = mx::argmax(last_logits, -1);
             mx::async_eval({next_next_token});
             next_token = next_next_token;
-            // Clear allocator cache periodically (matches mlx-lm every 256 tokens)
             if (i % 256 == 0) mx::clear_cache();
         }
         mx::eval({next_token});
