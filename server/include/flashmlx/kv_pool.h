@@ -19,6 +19,12 @@ public:
     int num_free() const;
     int max_slots() const { return max_slots_; }
     int num_layers() const { return num_layers_; }
+    int max_context_len() const { return max_context_len_; }
+
+    /// Bulk-write all layers' KV caches for a slot from external arrays
+    void write_slot(int slot_idx,
+                    const std::vector<mx::array>& keys,
+                    const std::vector<mx::array>& values);
 
 private:
     int max_slots_;

@@ -1771,6 +1771,16 @@ mx::array NemotronHModel::forward(
     return lm_head_proj(h);
 }
 
+// Stub: NemotronHModel doesn't need the scatter path yet — delegate to array-offset forward
+mx::array NemotronHModel::forward_heterogeneous(
+    const mx::array& input_ids,
+    std::vector<mx::array>& cache_keys,
+    std::vector<mx::array>& cache_values,
+    const mx::array& offsets,
+    int /*max_kv_len*/) {
+    return forward(input_ids, cache_keys, cache_values, offsets);
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark helpers
 // ---------------------------------------------------------------------------

@@ -36,3 +36,18 @@ target_compile_options(_flashmlx_engine PRIVATE ${MLX_CXX_FLAGS})
 
 # Install to python package directory
 install(TARGETS _flashmlx_engine DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/python)
+
+# Test: heterogeneous attention correctness
+add_executable(test_heterogeneous_attention
+    tests/test_heterogeneous_attention.cpp
+    src/model.cpp
+    src/nemotron_h.cpp
+    src/kv_pool.cpp
+    src/sampling.cpp
+)
+target_include_directories(test_heterogeneous_attention PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${MLX_INCLUDE_DIRS}
+)
+target_link_libraries(test_heterogeneous_attention PRIVATE mlx)
+target_compile_options(test_heterogeneous_attention PRIVATE ${MLX_CXX_FLAGS})

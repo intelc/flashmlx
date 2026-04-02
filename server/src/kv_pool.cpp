@@ -77,6 +77,15 @@ mx::array& KVCachePool::values(int slot_idx, int layer) {
     return cache_values_[slot_idx][layer];
 }
 
+void KVCachePool::write_slot(int slot_idx,
+                              const std::vector<mx::array>& keys,
+                              const std::vector<mx::array>& values) {
+    for (int l = 0; l < num_layers_; ++l) {
+        cache_keys_[slot_idx][l] = keys[l];
+        cache_values_[slot_idx][l] = values[l];
+    }
+}
+
 int KVCachePool::num_free() const {
     std::lock_guard<std::mutex> lock(mutex_);
     int count = 0;

@@ -84,6 +84,15 @@ public:
         std::vector<mx::array>& cache_values,
         const mx::array& cache_offsets) = 0;
 
+    /// Heterogeneous forward: batched decode with per-sequence cache offsets.
+    /// Uses scatter-based KV update and explicit mask — no mx::eval() sync.
+    virtual mx::array forward_heterogeneous(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        const mx::array& offsets,
+        int max_kv_len) = 0;
+
     virtual const ModelConfig& config() const = 0;
     virtual std::vector<int> debug_forward(const std::vector<int>& token_ids) = 0;
     virtual std::vector<float> debug_embed(const std::vector<int>& token_ids) = 0;
@@ -106,6 +115,15 @@ public:
         std::vector<mx::array>& cache_keys,
         std::vector<mx::array>& cache_values,
         int cache_offset) override;
+
+    /// Heterogeneous forward: batched decode with per-sequence offsets.
+    /// Scatter-based KV update + explicit mask — fully lazy, no mx::eval().
+    mx::array forward_heterogeneous(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        const mx::array& offsets,
+        int max_kv_len) override;
 
     const ModelConfig& config() const override { return config_; }
 
@@ -140,6 +158,14 @@ private:
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
         int cache_offset);
+    mx::array attention_heterogeneous(
+        const mx::array& x, int layer,
+        mx::array& cache_k, mx::array& cache_v,
+        const mx::array& offsets, int max_kv_len);
+    mx::array transformer_block_heterogeneous(
+        const mx::array& x, int layer,
+        mx::array& cache_k, mx::array& cache_v,
+        const mx::array& offsets, int max_kv_len);
     mx::array mlp(const mx::array& x, int layer);
     mx::array mlp_fast(const mx::array& x, int layer);
 
@@ -203,6 +229,14 @@ public:
         std::vector<mx::array>& cache_keys,
         std::vector<mx::array>& cache_values,
         int cache_offset) override;
+
+    /// Stub: falls back to array-offset forward (Nemotron-H doesn't need scatter path yet)
+    mx::array forward_heterogeneous(
+        const mx::array& input_ids,
+        std::vector<mx::array>& cache_keys,
+        std::vector<mx::array>& cache_values,
+        const mx::array& offsets,
+        int max_kv_len) override;
 
     const ModelConfig& config() const override { return config_; }
     std::vector<int> debug_forward(const std::vector<int>& token_ids) override;

@@ -59,7 +59,21 @@ private:
     void decode_batch(const std::vector<std::string>& ids,
                       std::unordered_map<std::string, std::vector<int>>& new_tokens,
                       std::vector<std::string>& done_ids);
+    void decode_batch_heterogeneous(const std::vector<std::string>& ids,
+                                    std::unordered_map<std::string, std::vector<int>>& new_tokens,
+                                    std::vector<std::string>& done_ids);
 
+
+    // Prefix cache: hash of prompt tokens -> pre-computed KV data
+    struct CachedPrefill {
+        std::vector<mx::array> keys;    // [1, n_kv, max_ctx, hd] per layer
+        std::vector<mx::array> values;
+        int offset;                      // prompt length
+    };
+    std::unordered_map<size_t, CachedPrefill> prefix_cache_;
+    static constexpr int kPrefixCacheMaxEntries = 32;
+
+    static size_t hash_tokens(const std::vector<int>& tokens);
 
     ModelBase& model_;
     KVCachePool& pool_;
