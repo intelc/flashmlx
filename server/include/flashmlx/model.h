@@ -161,11 +161,13 @@ private:
     mx::array attention_heterogeneous(
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
-        const mx::array& offsets, int max_kv_len);
+        const mx::array& offsets, int max_kv_len,
+        const mx::array& mask);
     mx::array transformer_block_heterogeneous(
         const mx::array& x, int layer,
         mx::array& cache_k, mx::array& cache_v,
-        const mx::array& offsets, int max_kv_len);
+        const mx::array& offsets, int max_kv_len,
+        const mx::array& mask);
     mx::array mlp(const mx::array& x, int layer);
     mx::array mlp_fast(const mx::array& x, int layer);
 

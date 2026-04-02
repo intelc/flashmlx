@@ -916,7 +916,8 @@ mx::array LlamaModel::transformer_block(
 mx::array LlamaModel::attention_heterogeneous(
     const mx::array& x, int layer,
     mx::array& cache_k, mx::array& cache_v,
-    const mx::array& offsets, int max_kv_len) {
+    const mx::array& offsets, int max_kv_len,
+    const mx::array& mask) {
 
     const auto& lw = layer_weights_[layer];
     int B = x.shape(0);
@@ -951,24 +952,12 @@ mx::array LlamaModel::attention_heterogeneous(
     k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, offsets);
 
     // KV cache scatter: batched put_along_axis — single op for all B elements.
-    // k shape: [B, n_kv_heads, 1, hd]
-    // offsets shape: [B] -> broadcast to [B, n_kv_heads, 1, hd]
     auto idx = mx::broadcast_to(mx::reshape(offsets, {B, 1, 1, 1}),
                                 {B, n_kv_heads, 1, hd});
     cache_k = mx::put_along_axis(cache_k, idx, k, 2);
     cache_v = mx::put_along_axis(cache_v, idx, v, 2);
 
-    // Build mask: positions [0..max_kv_len), valid where position <= offsets[b]
-    // offsets shape: [B] -> reshape to [B, 1, 1, 1] for broadcast
-    auto positions = mx::arange(0, max_kv_len, mx::int32);  // [max_kv_len]
-    auto offsets_4d = mx::reshape(offsets, {B, 1, 1, 1});    // [B, 1, 1, 1]
-    auto dtype = q.dtype();
-    auto mask = mx::where(
-        mx::less_equal(positions, offsets_4d),
-        mx::array(0.0f, dtype),
-        mx::array(-1e9f, dtype));  // [B, 1, 1, max_kv_len]
-
-    // Scaled dot product attention with explicit mask
+    // SDPA with pre-built mask (built once in forward_heterogeneous)
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     auto attn_out = mx::fast::scaled_dot_product_attention(
         q, cache_k, cache_v, scale, /*mask_mode=*/"", /*mask=*/mask);
@@ -981,11 +970,12 @@ mx::array LlamaModel::attention_heterogeneous(
 mx::array LlamaModel::transformer_block_heterogeneous(
     const mx::array& x, int layer,
     mx::array& cache_k, mx::array& cache_v,
-    const mx::array& offsets, int max_kv_len) {
+    const mx::array& offsets, int max_kv_len,
+    const mx::array& mask) {
 
     const auto& lw = layer_weights_[layer];
     auto normed = rms_norm(x, lw.input_norm_w);
-    auto attn_out = attention_heterogeneous(normed, layer, cache_k, cache_v, offsets, max_kv_len);
+    auto attn_out = attention_heterogeneous(normed, layer, cache_k, cache_v, offsets, max_kv_len, mask);
     auto h = mx::add(x, attn_out);
     auto normed2 = rms_norm(h, lw.post_norm_w);
 
@@ -1008,8 +998,19 @@ mx::array LlamaModel::forward_heterogeneous(
     int max_kv_len) {
 
     auto h = embed(input_ids);
+
+    // Build mask once for all layers
+    int B = input_ids.shape(0);
+    auto positions = mx::arange(0, max_kv_len, mx::int32);
+    auto offsets_4d = mx::reshape(offsets, {B, 1, 1, 1});
+    auto dtype = config_.activation_dtype;
+    auto mask = mx::where(
+        mx::less_equal(positions, offsets_4d),
+        mx::array(0.0f, dtype),
+        mx::array(-1e9f, dtype));  // [B, 1, 1, max_kv_len]
+
     for (int i = 0; i < config_.num_hidden_layers; i++) {
-        h = transformer_block_heterogeneous(h, i, cache_keys[i], cache_values[i], offsets, max_kv_len);
+        h = transformer_block_heterogeneous(h, i, cache_keys[i], cache_values[i], offsets, max_kv_len, mask);
     }
     h = rms_norm(h, *norm_w_);
     return lm_head(h);
