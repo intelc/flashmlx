@@ -565,7 +565,7 @@ void BatchScheduler::decode_batched(
         batch_ids_ = ids;
     }
 
-    // 3. Get cache state for forward pass
+    // 3. Get cache state
     std::vector<mx::array> cache_k, cache_v;
     cache_k.reserve(num_layers);
     cache_v.reserve(num_layers);
@@ -576,13 +576,14 @@ void BatchScheduler::decode_batched(
     auto rope_offsets = batch_kv_cache_.get_rope_offsets();
     auto mask = batch_kv_cache_.get_mask();
 
-    // 4. Forward pass — returns concatenated full caches (cache + new token)
+    // 4. Forward pass
     auto result = model_.forward_batched(input_ids, cache_k, cache_v, rope_offsets, mask);
 
-    // 5. Store the concatenated caches directly (no slice_update needed)
-    //    result.new_keys[l] is [B, n_kv, write_pos+1, hd] — already includes new token
-    batch_kv_cache_.replace_caches(result.new_keys, result.new_values);
-    batch_kv_cache_.advance();  // increment write_pos
+    // 5. Write new K/V to cache and advance
+    for (int l = 0; l < num_layers; l++) {
+        batch_kv_cache_.update(result.new_keys[l], result.new_values[l], l);
+    }
+    batch_kv_cache_.advance();
 
     // 6. Sample all tokens at once
     auto all_logits = mx::reshape(result.logits, {B, result.logits.shape(2)});

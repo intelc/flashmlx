@@ -35,11 +35,6 @@ public:
     /// Get RoPE offsets [B] = write_pos - left_padding
     mx::array get_rope_offsets() const;
 
-    /// Replace cache contents directly with concatenated full caches from forward_batched.
-    /// new_keys[l] shape: [B, n_kv, write_pos+1, hd] (already includes new token via concat)
-    void replace_caches(const std::vector<mx::array>& new_keys,
-                        const std::vector<mx::array>& new_values);
-
     /// Advance write position by 1
     void advance();
 
