@@ -129,6 +129,18 @@ mx::array BatchKVCache::get_values(int layer) const {
                      {batch_size_, n_kv_heads_, write_pos_, head_dim_});
 }
 
+mx::array BatchKVCache::get_keys_plus1(int layer) const {
+    if (!valid_) throw std::runtime_error("BatchKVCache::get_keys_plus1: cache not valid");
+    return mx::slice(*keys_[layer], {0, 0, 0, 0},
+                     {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
+}
+
+mx::array BatchKVCache::get_values_plus1(int layer) const {
+    if (!valid_) throw std::runtime_error("BatchKVCache::get_values_plus1: cache not valid");
+    return mx::slice(*values_[layer], {0, 0, 0, 0},
+                     {batch_size_, n_kv_heads_, write_pos_ + 1, head_dim_});
+}
+
 mx::array BatchKVCache::get_mask() const {
     if (!valid_) throw std::runtime_error("BatchKVCache::get_mask: cache not valid");
     return mx::slice(*mask_, {0, 0, 0, 0},

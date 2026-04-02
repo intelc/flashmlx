@@ -29,6 +29,10 @@ public:
     mx::array get_keys(int layer) const;
     mx::array get_values(int layer) const;
 
+    /// Get cache sliced to [B, n_kv, write_pos+1, hd] — includes newly written token
+    mx::array get_keys_plus1(int layer) const;
+    mx::array get_values_plus1(int layer) const;
+
     /// Get mask [B, 1, 1, write_pos] -- 0.0 for valid, -1e9 for padding
     mx::array get_mask() const;
 

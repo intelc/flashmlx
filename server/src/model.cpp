@@ -1165,20 +1165,42 @@ mx::array LlamaModel::forward_batched_inplace(
         const auto& lw = layer_weights_[i];
         auto normed = rms_norm(h, lw.input_norm_w);
 
-        // Get cache view, run attention, update cache, release view — per layer.
-        // Scoping ensures views are dead before next layer's update,
-        // enabling buffer donation (in-place Metal writes).
+        // Update-before-SDPA: write new K/V to cache first, then run SDPA
+        // on the full cache including the new token. Avoids concat.
         {
-            auto ck = cache.get_keys(i);
-            auto cv = cache.get_values(i);
-            auto [attn_out_inner, new_k, new_v] = attention_batched(
-                normed, i, ck, cv, rope_offsets, mask);
-            h = mx::add(h, attn_out_inner);
-            // ck, cv go out of scope after this block — but we need to update first.
-            // Move them to release the view reference before update.
-            ck = mx::array(0);  // release view
-            cv = mx::array(0);
-            cache.update(new_k, new_v, i);
+            int B = input_ids.shape(0);
+            int n_kv_heads = config_.num_key_value_heads;
+            int hd = head_dim_;
+            int n_heads = config_.num_attention_heads;
+            int L = 1;
+
+            auto q = linear_fast(normed, lw.q_w, lw.q_s, lw.q_b);
+            auto k = linear_fast(normed, lw.k_w, lw.k_s, lw.k_b);
+            auto v = linear_fast(normed, lw.v_w, lw.v_s, lw.v_b);
+            if (lw.q_bias) q = mx::add(q, *lw.q_bias);
+            if (lw.k_bias) k = mx::add(k, *lw.k_bias);
+            if (lw.v_bias) v = mx::add(v, *lw.v_bias);
+            q = mx::transpose(mx::reshape(q, {B, L, n_heads, hd}), {0, 2, 1, 3});
+            k = mx::transpose(mx::reshape(k, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
+            v = mx::transpose(mx::reshape(v, {B, L, n_kv_heads, hd}), {0, 2, 1, 3});
+            if (lw.has_q_norm) { q = rms_norm(q, lw.q_norm_w); k = rms_norm(k, lw.k_norm_w); }
+            q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, rope_offsets);
+            k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, rope_offsets);
+
+            // Write K/V to cache at write_pos BEFORE SDPA
+            cache.update(k, v, i);
+
+            // SDPA on full cache [0:write_pos+1] — includes new token
+            auto full_k = cache.get_keys_plus1(i);
+            auto full_v = cache.get_values_plus1(i);
+            auto valid_col = mx::zeros({B, 1, 1, 1}, mask.dtype());
+            auto full_mask = mx::concatenate({mask, valid_col}, 3);
+
+            float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            auto attn_out = mx::fast::scaled_dot_product_attention(
+                q, full_k, full_v, scale, "", full_mask);
+            attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
+            h = mx::add(h, linear_fast(attn_out, lw.o_w, lw.o_s, lw.o_b));
         }
 
         auto normed2 = rms_norm(h, lw.post_norm_w);
