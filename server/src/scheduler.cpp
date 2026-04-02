@@ -573,20 +573,10 @@ void BatchScheduler::decode_batched(
     auto logits = model_.forward_batched_inplace(input_ids, batch_kv_cache_, rope_offsets, mask);
     batch_kv_cache_.advance();
 
-    // 4. Sample all tokens + eval cache updates in one call
-    //    This amortizes the eval overhead by batching token + cache evaluation
+    // 4. Sample all tokens at once
     auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
     auto all_tokens = mx::argmax(all_logits, -1);
-    {
-        std::vector<mx::array> to_eval = {all_tokens};
-        // Include updated cache arrays in the eval to avoid separate periodic eval
-        int num_layers_local = batch_kv_cache_.valid() ? pool_.num_layers() : 0;
-        for (int l = 0; l < num_layers_local; l++) {
-            to_eval.push_back(batch_kv_cache_.get_keys(l));
-            to_eval.push_back(batch_kv_cache_.get_values(l));
-        }
-        mx::eval(to_eval);
-    }
+    mx::eval({all_tokens});
 
     bool any_done = false;
     for (int b = 0; b < B; b++) {
