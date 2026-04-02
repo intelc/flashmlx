@@ -24,6 +24,7 @@ pybind11_add_module(_flashmlx_engine
     src/model.cpp
     src/nemotron_h.cpp
     src/kv_pool.cpp
+    src/batch_kv_cache.cpp
     src/sampling.cpp
     src/scheduler.cpp
 )
@@ -43,6 +44,7 @@ add_executable(test_heterogeneous_attention
     src/model.cpp
     src/nemotron_h.cpp
     src/kv_pool.cpp
+    src/batch_kv_cache.cpp
     src/sampling.cpp
 )
 target_include_directories(test_heterogeneous_attention PRIVATE
