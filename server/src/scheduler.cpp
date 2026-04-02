@@ -501,18 +501,17 @@ void BatchScheduler::decode_batch_heterogeneous(
         }
     }
 
-    // 6. Sample tokens per-request
-    //    logits shape: [B, 1, vocab_size]
+    // 6. Sample all tokens at once (single eval for all B requests)
+    //    logits shape: [B, 1, vocab_size] -> [B, vocab_size]
+    auto all_logits = mx::reshape(logits, {B, logits.shape(2)});
+    auto all_tokens = mx::argmax(all_logits, -1);  // [B]
+    mx::eval({all_tokens});
+
     for (int b = 0; b < B; b++) {
         auto& req = active_[ids[b]];
-        auto req_logits = mx::slice(logits, {b, 0, 0}, {b + 1, 1, logits.shape(2)});
-        req_logits = mx::reshape(req_logits, {1, -1});
+        int tok_id = mx::slice(all_tokens, {b}, {b + 1}).item<int>();
 
-        mx::array token = sample_token(req_logits, req.temperature);
-        mx::eval({token});
-        int tok_id = token.item<int>();
-
-        req.next_token = token;
+        req.next_token = mx::array({tok_id}, mx::int32);
         req.output_tokens.push_back(tok_id);
         req.generated_count++;
         req.cache_offset++;
