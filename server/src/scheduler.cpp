@@ -366,25 +366,27 @@ void BatchScheduler::decode_batch_heterogeneous(
     int n_kv = model_.config().num_key_value_heads;
     int hd = model_.config().head_dim > 0 ? model_.config().head_dim
              : model_.config().hidden_size / model_.config().num_attention_heads;
-    int max_kv_len = pool_.max_context_len();
-
-    // 1. Build batched input_ids [B, 1]
+    // 1. Build batched input_ids [B, 1] and offsets [B]
     std::vector<int> tok_ids;
+    std::vector<int> offset_vec;
     tok_ids.reserve(B);
+    offset_vec.reserve(B);
+    int max_offset = 0;
     for (auto& id : ids) {
         tok_ids.push_back(active_[id].next_token.item<int>());
+        int off = active_[id].cache_offset;
+        offset_vec.push_back(off);
+        if (off > max_offset) max_offset = off;
     }
     auto input_ids = mx::array(tok_ids.data(), {B, 1}, mx::int32);
-
-    // 2. Build offsets [B] from each request's cache_offset
-    std::vector<int> offset_vec;
-    offset_vec.reserve(B);
-    for (auto& id : ids) {
-        offset_vec.push_back(active_[id].cache_offset);
-    }
     auto offsets = mx::array(offset_vec.data(), {B}, mx::int32);
 
-    // 3. Concatenate KV caches from pool slots: [B, n_kv, max_kv_len, hd]
+    // Use max(offsets) + 1 as effective KV length — avoids processing padding in SDPA
+    int max_kv_len = max_offset + 1;
+
+    // 2. Concatenate KV caches from pool slots, sliced to effective length
+    //    Pool caches are [1, n_kv, pool_max_ctx, hd] — slice to [1, n_kv, max_kv_len, hd]
+    int pool_max_ctx = pool_.max_context_len();
     std::vector<mx::array> batch_cache_k, batch_cache_v;
     batch_cache_k.reserve(num_layers);
     batch_cache_v.reserve(num_layers);
@@ -393,8 +395,10 @@ void BatchScheduler::decode_batch_heterogeneous(
         std::vector<mx::array> k_parts, v_parts;
         for (auto& id : ids) {
             int slot = active_[id].kv_slot;
-            k_parts.push_back(pool_.keys(slot, l));
-            v_parts.push_back(pool_.values(slot, l));
+            k_parts.push_back(mx::slice(pool_.keys(slot, l),
+                {0, 0, 0, 0}, {1, n_kv, max_kv_len, hd}));
+            v_parts.push_back(mx::slice(pool_.values(slot, l),
+                {0, 0, 0, 0}, {1, n_kv, max_kv_len, hd}));
         }
         batch_cache_k.push_back(mx::concatenate(k_parts, 0));
         batch_cache_v.push_back(mx::concatenate(v_parts, 0));
@@ -404,13 +408,19 @@ void BatchScheduler::decode_batch_heterogeneous(
     mx::array logits = model_.forward_heterogeneous(input_ids, batch_cache_k, batch_cache_v, offsets, max_kv_len);
 
     // 5. Split updated caches back to pool slots
+    //    Batch caches are [B, n_kv, max_kv_len, hd] — write back into full pool buffers
+    int new_kv_len = max_kv_len + 1;  // forward_heterogeneous wrote one new token
     for (int l = 0; l < num_layers; l++) {
         for (int b = 0; b < B; b++) {
             int slot = active_[ids[b]].kv_slot;
-            pool_.keys(slot, l) = mx::slice(batch_cache_k[l], {b, 0, 0, 0},
-                {b + 1, n_kv, max_kv_len, hd});
-            pool_.values(slot, l) = mx::slice(batch_cache_v[l], {b, 0, 0, 0},
-                {b + 1, n_kv, max_kv_len, hd});
+            auto slice_k = mx::slice(batch_cache_k[l], {b, 0, 0, 0},
+                {b + 1, n_kv, batch_cache_k[l].shape(2), hd});
+            auto slice_v = mx::slice(batch_cache_v[l], {b, 0, 0, 0},
+                {b + 1, n_kv, batch_cache_v[l].shape(2), hd});
+            pool_.keys(slot, l) = mx::slice_update(pool_.keys(slot, l), slice_k,
+                {0, 0, 0, 0}, {1, n_kv, batch_cache_k[l].shape(2), hd});
+            pool_.values(slot, l) = mx::slice_update(pool_.values(slot, l), slice_v,
+                {0, 0, 0, 0}, {1, n_kv, batch_cache_v[l].shape(2), hd});
         }
     }
 

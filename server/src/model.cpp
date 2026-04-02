@@ -950,35 +950,13 @@ mx::array LlamaModel::attention_heterogeneous(
     q = mx::fast::rope(q, hd, false, config_.rope_theta, 1.0f, offsets);
     k = mx::fast::rope(k, hd, false, config_.rope_theta, 1.0f, offsets);
 
-    // KV cache scatter: write each batch element's token at its offset position.
-    // B is small (<=8), so a loop over batch elements is fine.
+    // KV cache scatter: batched put_along_axis — single op for all B elements.
     // k shape: [B, n_kv_heads, 1, hd]
-    for (int b = 0; b < B; b++) {
-        // Extract single-batch slice: [1, n_kv_heads, 1, hd]
-        auto k_b = mx::slice(k, {b, 0, 0, 0}, {b + 1, n_kv_heads, 1, hd});
-        auto v_b = mx::slice(v, {b, 0, 0, 0}, {b + 1, n_kv_heads, 1, hd});
-
-        // Build index: offsets[b] broadcast to [1, n_kv_heads, 1, hd]
-        auto off_b = mx::slice(offsets, {b}, {b + 1});  // [1]
-        auto idx = mx::broadcast_to(mx::reshape(off_b, {1, 1, 1, 1}),
-                                    {1, n_kv_heads, 1, hd});
-
-        // Scatter write into cache at the offset position along axis 2
-        auto ck_b = mx::slice(cache_k, {b, 0, 0, 0}, {b + 1, n_kv_heads, max_kv_len, hd});
-        auto cv_b = mx::slice(cache_v, {b, 0, 0, 0}, {b + 1, n_kv_heads, max_kv_len, hd});
-        ck_b = mx::put_along_axis(ck_b, idx, k_b, 2);
-        cv_b = mx::put_along_axis(cv_b, idx, v_b, 2);
-
-        // Write back into the full cache
-        cache_k = mx::slice_update(cache_k, ck_b,
-            {b, 0, 0, 0}, {b + 1, n_kv_heads, max_kv_len, hd});
-        cache_v = mx::slice_update(cache_v, cv_b,
-            {b, 0, 0, 0}, {b + 1, n_kv_heads, max_kv_len, hd});
-    }
-
-    // Slice the cache to max_kv_len for attention
-    auto full_k = mx::slice(cache_k, {0, 0, 0, 0}, {B, n_kv_heads, max_kv_len, hd});
-    auto full_v = mx::slice(cache_v, {0, 0, 0, 0}, {B, n_kv_heads, max_kv_len, hd});
+    // offsets shape: [B] -> broadcast to [B, n_kv_heads, 1, hd]
+    auto idx = mx::broadcast_to(mx::reshape(offsets, {B, 1, 1, 1}),
+                                {B, n_kv_heads, 1, hd});
+    cache_k = mx::put_along_axis(cache_k, idx, k, 2);
+    cache_v = mx::put_along_axis(cache_v, idx, v, 2);
 
     // Build mask: positions [0..max_kv_len), valid where position <= offsets[b]
     // offsets shape: [B] -> reshape to [B, 1, 1, 1] for broadcast
@@ -993,7 +971,7 @@ mx::array LlamaModel::attention_heterogeneous(
     // Scaled dot product attention with explicit mask
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     auto attn_out = mx::fast::scaled_dot_product_attention(
-        q, full_k, full_v, scale, /*mask_mode=*/"", /*mask=*/mask);
+        q, cache_k, cache_v, scale, /*mask_mode=*/"", /*mask=*/mask);
 
     // [B, n_heads, L, hd] -> [B, L, n_heads * hd]
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
